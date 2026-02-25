@@ -5,7 +5,6 @@ from match_predictor import BSD_TOKEN, BASE_URL, get_match_analysis
 
 app = Flask(__name__)
 
-# PREMIUM UI WRAPPER
 LAYOUT = """
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
@@ -26,7 +25,6 @@ LAYOUT = """
 """
 
 def get_badge(name):
-    # Returns a stylish initials-based badge for each team
     return f"https://api.dicebear.com/7.x/initials/svg?seed={name}&backgroundColor=10141d&fontSize=45&bold=true"
 
 @app.route("/")
@@ -42,12 +40,12 @@ def home():
 
     leagues = {}
     for m in matches:
-        lname = m.get('event', {}).get('league_name') or "Active Leagues"
+        e = m.get('event', {})
+        lname = e.get('league_name') or "Active Leagues"
         if lname not in leagues: leagues[lname] = []
         leagues[lname].append(m)
 
     content = '<div class="mb-10 text-zinc-700 text-[9px] font-black uppercase tracking-[0.5em] italic text-center">AI Surveillance Active</div>'
-    
     for lname, m_list in leagues.items():
         content += f'<h2 class="text-green-500 text-[10px] font-black tracking-[0.4em] mb-4 mt-12 uppercase border-l-4 border-green-500 pl-4 italic">{lname}</h2>'
         for m in m_list:
@@ -55,7 +53,6 @@ def home():
             m_id = str(m.get('id'))
             h_team, a_team = e.get('home_team', 'Home'), e.get('away_team', 'Away')
             status = '<div class="flex items-center gap-2 text-[9px] text-red-500 font-black italic px-4 uppercase tracking-tighter"><span class="pulse-red w-1.5 h-1.5 bg-red-500 rounded-full"></span> LIVE</div>' if m_id in live_ids else '<div class="text-[9px] text-zinc-900 font-black italic px-4 uppercase tracking-tighter text-center italic">ANALYZE</div>'
-            
             content += f'''
             <a href="/match?id={m_id}" class="flex justify-between items-center p-6 bg-[#0f1218] rounded-2xl mb-2 border border-white/5 hover:border-green-500/30 transition group shadow-xl">
                 <div class="w-2/5 flex items-center justify-end gap-3 font-bold text-white text-sm group-hover:text-green-400 uppercase">
@@ -74,10 +71,8 @@ def home():
 def match():
     res = get_match_analysis(request.args.get("id"))
     if "error" in res: return render_template_string(LAYOUT, content='<a href="/">Back</a><p class="mt-20 text-center uppercase font-black text-red-500">Sync Error</p>')
-    
     risk_color = "text-green-400" if res['best_tip']['risk'] == "Low" else "text-yellow-400" if res['best_tip']['risk'] == "Medium" else "text-red-500"
     diff_color = "text-green-400" if res['difficulty'] == "Easy" else "text-yellow-400" if res['difficulty'] == "Moderate" else "text-red-500"
-    
     content = f'''
     <div class="flex justify-between items-center mb-6">
         <a href="/" class="text-zinc-600 font-bold text-[10px] uppercase tracking-widest hover:text-white block">← Return</a>
@@ -97,17 +92,6 @@ def match():
             <p class="text-[10px] font-black text-zinc-500 uppercase tracking-tighter">{res['a_name']}</p>
         </div>
     </div>
-    '''
-    
-    if res.get('live_status'):
-        ls = res['live_status']
-        content += f'''
-        <div class="mb-8 flex items-center justify-between bg-red-500/10 border border-red-500/20 p-6 rounded-[2rem]">
-            <div class="flex items-center gap-3"><span class="pulse-red w-2 h-2 bg-red-500 rounded-full"></span><span class="text-[10px] font-black text-red-500 tracking-widest uppercase italic">LIVE: {ls['min']}</span></div>
-            <span class="text-3xl font-black text-white italic tracking-tighter">{ls['score']}</span>
-        </div>'''
-
-    content += f'''
     <div class="grid lg:grid-cols-2 gap-8 mb-10">
         <div class="bg-gradient-to-br from-[#10141d] to-[#07090e] p-10 rounded-[3rem] border border-white/5 shadow-2xl relative overflow-hidden">
             <span class="text-[10px] font-black uppercase text-zinc-500 mb-4 block tracking-widest italic underline decoration-green-500">{res['league']} • {res['time']}</span>
@@ -121,6 +105,14 @@ def match():
             </ul>
         </div>
         <div class="space-y-6">
+            <div class="bg-[#0f1218] p-8 rounded-[2.5rem] border border-white/5 shadow-xl text-center">
+                <h4 class="text-[9px] font-black uppercase text-zinc-600 mb-6 tracking-widest italic underline decoration-zinc-800">Team Momentum</h4>
+                <div class="flex justify-between items-center text-center px-4">
+                    <div class="flex-1 text-2xl font-black text-white italic">{res['h_mom']}</div>
+                    <div class="px-2 text-zinc-900 font-black italic">VS</div>
+                    <div class="flex-1 text-2xl font-black text-white italic">{res['a_mom']}</div>
+                </div>
+            </div>
             <div class="bg-[#0f1218] p-8 rounded-[2.5rem] border border-white/5 shadow-xl">
                 <h4 class="text-[9px] font-black uppercase text-zinc-600 mb-6 tracking-widest italic text-center underline decoration-zinc-800">Market Intelligence</h4>
                 <div class="space-y-5">
@@ -145,7 +137,6 @@ def acca():
             max_p = max(h_p, a_p, o25_p)
             if max_p > 70:
                 bankers.append({"e": m.get('event', {}), "t": "Home Win" if max_p == h_p else "Away Win" if max_p == a_p else "Over 2.5", "c": max_p})
-        
         bankers = sorted(bankers, key=lambda x: x['c'], reverse=True)[:4]
         content = '<h2 class="text-4xl font-black text-white italic mb-10 tracking-tighter uppercase underline decoration-green-500 text-center">PRO ACCA HUB</h2>'
         content += '<div class="bg-[#0f1218] p-10 rounded-[3rem] border border-white/5 shadow-2xl">'
@@ -162,6 +153,7 @@ def acca():
                 </div>'''
         content += '</div>'
         return render_template_string(LAYOUT, content=content)
+    except: return "Sync Error"
 
 @app.route("/stats")
 def stats():
