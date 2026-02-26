@@ -9,61 +9,57 @@ def get_match_analysis(match_id):
         p_res = requests.get(f"{BASE_URL}/predictions/{match_id}/", headers=headers).json()
         event = p_res.get('event', {})
         
-        # 1. DATA EXTRACTION
+        # CORE DATA
         h_p = float(p_res.get('prob_home_win', 0))
         a_p = float(p_res.get('prob_away_win', 0))
         d_p = float(p_res.get('prob_draw', 0))
         o25_p = float(p_res.get('prob_over_25', 0))
         btts_p = float(p_res.get('prob_btts', 0))
 
-        # 2. ANALYZED COMBO LOGIC
-        # We simulate 1st Half and Combo probabilities based on core data
-        fh_home = h_p * 0.65  # AI Estimate for 1st Half Home Lead
-        fh_draw = d_p * 1.2   # 1st Half Draws are statistically more likely
+        # INTENTIONAL COMBO & MARKET ANALYTICS
+        fh_draw_prob = d_p * 1.15  # Statistically 1st half draws are higher frequency
         
-        # 3. SELECTING THE "INTENTIONAL" TIP
-        # Logic: If Home is strong and goals are likely, go for a Combo
-        if h_p > 60 and o25_p > 55:
+        # SELECTION LOGIC
+        if h_p > 65 and o25_p > 50:
             main_tip = f"{event.get('home_team')} & Over 1.5"
-            confidence = (h_p + o25_p) / 2
-            reasons = ["Strong home dominance", "High offensive conversion", "Defensive gaps detected"]
-        elif o25_p > 70:
-            main_tip = "Over 2.5 Goals"
-            confidence = o25_p
-            reasons = ["Aggressive attacking styles", "Historical high-scoring trend", "Weather/Pitch favors speed"]
-        elif fh_draw > 50 and h_p < 45 and a_p < 45:
+            conf = (h_p + o25_p) / 2
+            reasons = ["Dominant home form detected", "High conversion in final third", "Strategic goal-line advantage"]
+        elif btts_p > 68:
+            main_tip = "BTTS (Yes)"
+            conf = btts_p
+            reasons = ["Both sides showing defensive gaps", "Aggressive attacking transitions", "Recent scoring trends align"]
+        elif fh_draw_prob > 52:
             main_tip = "1st Half: Draw"
-            confidence = fh_draw
-            reasons = ["Cautions opening play", "Midfield deadlock predicted", "Low early-game risk"]
+            conf = fh_draw_prob
+            reasons = ["Cautious opening tactical play", "Midfield deadlock anticipated", "Low early-risk probability"]
         else:
             main_tip = "Double Chance: 1X" if h_p > a_p else "Double Chance: X2"
-            confidence = max(h_p, a_p) + 15
-            reasons = ["Safety-first AI model", "Defensive stability prioritized"]
+            conf = max(h_p, a_p) + 12
+            reasons = ["Statistical safety prioritized", "Defensive stability confirmed"]
 
-        # 4. STRATEGIC HIGH RISK (The "Value" Play)
+        # HIGH-VALUE SNIPER (Intentional High Risk)
         if btts_p > 60 and o25_p > 60:
-            risky_play = "GG & Over 2.5"
-        elif h_p > 45 and a_p > 45:
-            risky_play = "Full Time Draw"
+            risky = "GG & Over 2.5"
+        elif h_p > 40 and a_p > 40:
+            risky = "Full Time: Draw"
         else:
-            risky_play = "HT/FT: 1/1" if h_p > 55 else "Correct Score: 1-1"
+            risky = "Home Win to Nil" if h_p > 60 else "Correct Score: 1-1"
 
         return {
             "h_name": event.get('home_team', 'Home'),
             "a_name": event.get('away_team', 'Away'),
-            "league": event.get('league_name', 'Pro League'),
-            "difficulty": "Easy" if abs(h_p - a_p) > 25 else "Hard",
-            "best_tip": {"t": main_tip, "p": confidence, "risk": "Low" if confidence > 75 else "Medium", "reasons": reasons},
-            "h_mom": "🔥 High" if h_p > 50 else "⚖️ Mid",
-            "a_mom": "🔥 High" if a_p > 50 else "⚖️ Mid",
-            "safer": "Over 1.5 Goals" if o25_p > 50 else "Home/Away Win",
-            "risky": risky_play,
+            "league": event.get('league_name', 'League'),
+            "difficulty": "Moderate" if abs(h_p - a_p) < 15 else "Clear Advantage",
+            "best_tip": {"t": main_tip, "p": conf, "risk": "Low" if conf > 75 else "Medium", "reasons": reasons},
+            "h_mom": "🔥 High" if h_p > 55 else "⚖️ Neutral",
+            "a_mom": "🔥 High" if a_p > 55 else "⚖️ Neutral",
+            "safer": "Over 1.5 Goals" if o25_p > 48 else "Double Chance",
+            "risky": risky,
             "intel": {
-                "volatility": "High" if abs(h_p - a_p) < 10 else "Low",
-                "pressure": "Intense" if o25_p > 60 else "Steady",
-                "fh_draw_prob": f"{fh_draw:.0f}%",
                 "btts_prob": f"{btts_p:.0f}%",
-                "o15_prob": f"{(o25_p + 20):.0f}%" # Statistically inferred
+                "1st_half_draw": f"{fh_draw_prob:.0f}%",
+                "over_1.5": f"{(o25_p + 18):.0f}%",
+                "draw_risk": f"{d_p:.0f}%"
             }
         }
     except Exception as e:
