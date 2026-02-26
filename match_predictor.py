@@ -235,16 +235,18 @@ def _pick_recommended(h_win, draw, a_win, o15, o25, o35, btts, gg_p, ng_p,
                       h_xg, a_xg, h_form, a_form, h_stand, a_stand,
                       odds_h, odds_d, odds_a, odds_o15, odds_o25, odds_btts):
     """
-    RECOMMENDED TIP: 1X2, GG/NG, Over/Under, Team Goals
-    Conviction-scored — not just highest probability.
+    RECOMMENDED TIP — Market hierarchy rules:
+      - DRAW is BANNED from Recommended. Draws belong in Risky.
+      - OVER 1.5 is BANNED from Recommended. Too basic — belongs in Safest.
+      - NG (No Goals) is BANNED. Rarely meaningful.
+      - Minimum probability threshold: tip must be >= 45% to qualify.
+      - If only Over 1.5 / Draw qualify, fall back to HOME WIN or AWAY WIN.
+    Valid markets: HOME WIN, AWAY WIN, GG, OVER 2.5, OVER 3.5, UNDER 2.5
     """
     candidates = {
         "HOME WIN":  (h_win,  odds_h),
-        "DRAW":      (draw,   odds_d),
         "AWAY WIN":  (a_win,  odds_a),
-        "GG":        (gg_p,   odds_btts),   # GG ≈ BTTS
-        "NG":        (ng_p,   None),
-        "OVER 1.5":  (o15,    odds_o15),
+        "GG":        (gg_p,   odds_btts),
         "OVER 2.5":  (o25,    odds_o25),
         "OVER 3.5":  (o35,    None),
         "UNDER 2.5": (100-o25, None),
@@ -253,7 +255,11 @@ def _pick_recommended(h_win, draw, a_win, o15, o25, o35, btts, gg_p, ng_p,
     for tip, (prob, odds) in candidates.items():
         scores[tip] = conviction_score(tip, prob, odds, h_xg, a_xg,
                                        h_form, a_form, h_stand, a_stand)
-    best = max(scores, key=scores.get)
+    # Only consider tips with prob >= 40%
+    valid = {t: s for t, s in scores.items() if candidates[t][0] >= 40}
+    if not valid:
+        valid = scores  # fallback: use all if none qualify
+    best = max(valid, key=valid.get)
     prob, odds = candidates[best]
     return best, round(prob, 1), scores[best], odds, scores
 
@@ -291,18 +297,28 @@ def _pick_safest(rec_tip, h_win, draw, a_win, o15, h_xg, a_xg, h_form, a_form,
     # Remove if same as recommended
     candidates = [(t, p, o) for t, p, o in candidates if t != rec_tip]
 
-    # Pick best safe tip that is genuinely safe (high probability)
+    # Pick highest-probability safe tip (this slot is for stake protection)
     best = max(candidates, key=lambda x: x[1])
-    return best[0], best[1], best[2]
+    # Always round probability to 1 decimal
+    return best[0], round(best[1], 1), best[2]
 
 def _pick_risky(h_win, draw, a_win, o15, o25, btts,
                 h_xg, a_xg, h_form, a_form,
                 odds_h, odds_a, odds_o25, odds_btts):
     """
-    RISKY MARKET: HT/FT, Combo tips (1X2+GG, 1X2+Overs, WIN+Overs)
-    Joint probability markets — high odds, lower certainty.
+    RISKY MARKET: DRAW, HT/FT, Combo tips (1X2+GG, 1X2+Overs, WIN+Overs)
+    Draws live here — they are specialist high-risk selections.
     """
     combos = []
+
+    # DRAW always goes in risky — it's a specialist bet
+    if draw >= 20:
+        draw_odds = round(1 / (draw/100), 2) if draw > 0 else 3.2
+        combos.append({
+            "tip":  "DRAW",
+            "prob": round(draw, 1),
+            "odds": round(draw_odds, 2),
+        })
 
     # 1X2 + GG combos
     if h_win > a_win:
@@ -342,10 +358,23 @@ def _pick_risky(h_win, draw, a_win, o15, o25, btts,
         ht_ft_prob = round(a_win * 0.52, 1)
         combos.append({"tip": f"HT/FT: AWAY / AWAY", "prob": ht_ft_prob, "odds": round(100/max(ht_ft_prob,1), 2)})
 
-    # Filter: keep only combos with prob > 15% and odds < 25
-    combos = [c for c in combos if c["prob"] >= 15 and c["odds"] <= 25]
-    combos.sort(key=lambda x: x["prob"], reverse=True)
-    return combos[:3] if combos else [{"tip": "GG & OVER 1.5", "prob": round(btts/100 * o15/100 * 100, 1), "odds": round(1/(btts/100) * 1/(o15/100), 2)}]
+    # Filter: keep combos with prob > 15% and reasonable odds
+    draw_entry = next((c for c in combos if c["tip"] == "DRAW"), None)
+    other_combos = [c for c in combos if c["tip"] != "DRAW"
+                    and c["prob"] >= 15 and c["odds"] <= 25]
+    other_combos.sort(key=lambda x: x["prob"], reverse=True)
+
+    # Always show DRAW first in risky if it qualifies (>= 20%)
+    result = []
+    if draw_entry and draw_entry["prob"] >= 20:
+        result.append(draw_entry)
+    result.extend(other_combos[:3])  # up to 3 combos after draw
+
+    if not result:
+        result = [{"tip": "GG & OVER 1.5",
+                   "prob": round(btts/100 * o15/100 * 100, 1),
+                   "odds": round(1/(btts/100) * 1/(o15/100), 2)}]
+    return result[:4]
 
 # ── MAIN ANALYSIS ─────────────────────────────────────────────────────────────
 
@@ -423,8 +452,26 @@ def analyze_match(api_data, league_id=None, enriched=None):
         )
         risky_main = risky_list[0]
 
-        # Tag
-        if rec_conv >= 65 and rec_agree >= 2:
+        # ── Smart tagging system ──
+        # Slump detection: 3+ consecutive losses
+        h_slump = (list(h_form[-3:]).count("L") >= 3) if len(h_form) >= 3 else False
+        a_slump = (list(a_form[-3:]).count("L") >= 3) if len(a_form) >= 3 else False
+        fav_win = max(h_win, a_win)
+        has_injuries = enriched and (enriched.get("home_injuries") or enriched.get("away_injuries"))
+
+        # SURE MATCH: dominant favourite (>85%), signals mostly agree, no slump
+        if fav_win >= 85 and rec_agree >= 1 and not h_slump and not a_slump and rec_conv >= 60:
+            tag = "✅ SURE MATCH"
+        # AVOID: slump OR key injuries AND low conviction
+        elif (h_slump or a_slump) and has_injuries and rec_conv < 55:
+            tag = "⚠️ AVOID"
+        # AVOID: match is too unpredictable (all probs close to 33%)
+        elif abs(h_win - draw) < 5 and abs(draw - a_win) < 5 and rec_conv < 45:
+            tag = "⚠️ AVOID"
+        # RELIABLE: all 3 signals agree, high conviction
+        elif rec_agree >= 3 and rec_conv >= 60:
+            tag = "🛡️ RELIABLE"
+        elif rec_conv >= 65 and rec_agree >= 2:
             tag = "ELITE PICK"
         elif rec_conv >= 55 and rec_agree >= 1:
             tag = "STRONG PICK"
@@ -444,10 +491,10 @@ def analyze_match(api_data, league_id=None, enriched=None):
             # Tip tiers
             "recommended": {
                 "tip":    rec_tip,
-                "prob":   rec_prob,
+                "prob":   round(rec_prob, 1),
                 "odds":   rec_fair_odds,
                 "edge":   rec_edge,
-                "conv":   rec_conv,
+                "conv":   round(rec_conv, 1),
                 "agree":  rec_agree,
                 "reason": rec_reason,
             },
@@ -489,7 +536,15 @@ def pick_acca(matches, n=5, min_conv=42.0):
     picks = []; league_count = {}; tip_count = {}
     for s in scored:
         lg  = s["league_id"]
-        tip = s["result"]["recommended"]["tip"]
+        rec = s["result"]["recommended"]
+        tip = rec["tip"]
+        # Quality gates for ACCA inclusion:
+        # 1. No junk odds — minimum fair odds of 1.20 (prob <= 83%)
+        # 2. No AVOID-tagged matches
+        # 3. No OVER 1.5 in ACCA — too low value
+        if rec["odds"] < 1.20: continue
+        if s["result"]["tag"] in ("⚠️ AVOID",): continue
+        if tip == "OVER 1.5": continue
         if league_count.get(lg, 0) >= 2: continue
         if tip_count.get(tip, 0) >= 2:   continue
         league_count[lg]  = league_count.get(lg, 0) + 1
