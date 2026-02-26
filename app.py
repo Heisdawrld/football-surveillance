@@ -273,7 +273,43 @@ def match_display(match_id):
         c += '</div>'
     elif not external_data.APIFOOTBALL_KEY:
         c += '<div class="info-box fu d1">Add <strong>APIFOOTBALL_KEY</strong> environment variable to unlock H2H history, injury reports and season stats — free at api-football.com</div>'
-    c += f'<div class="rec-box fu d1"><p class="eyebrow">Best Market</p><p class="rec-market">{res["rec"]["t"]}</p><div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap"><p class="rec-pct">{res["rec"]["p"]}%</p><div><p style="font-size:0.58rem;letter-spacing:1.5px;color:var(--t)">FAIR ODDS</p><p class="display" style="font-size:1.5rem">{res["rec"]["odds"]}</p></div>{"<div>"+edge_html+"</div>" if edge_html else ""}</div><p style="font-size:0.65rem;color:var(--t);margin-top:8px">Also consider: <strong style="color:var(--wh)">{res["second"]["t"]}</strong> ({res["second"]["p"]}%)</p></div>'
+    # ── Three-tier tip display ──
+    mn = res["main"]; sf = res["safe"]; rk = res["risky"]
+    agree_dots = "".join(['<span style="width:7px;height:7px;border-radius:50%;background:var(--g);display:inline-block;margin-right:3px"></span>' for _ in range(mn["agree"])] + ['<span style="width:7px;height:7px;border-radius:50%;background:var(--bdr);border:1px solid var(--t);display:inline-block;margin-right:3px"></span>' for _ in range(3 - mn["agree"])])
+    mn_edge = mn.get("edge"); mn_edge_html = f'<span class="edge {"edge-pos" if mn_edge and mn_edge>0 else "edge-neg"}">{"+" if mn_edge and mn_edge>0 else ""}{mn_edge}% edge</span>' if mn_edge is not None else ""
+    sf_edge = sf.get("edge"); sf_edge_html = f'<span class="edge {"edge-pos" if sf_edge and sf_edge>0 else "edge-neg"}">{"+" if sf_edge and sf_edge>0 else ""}{sf_edge}% edge</span>' if sf_edge is not None else ""
+    c += f'''<div class="rec-box fu d1">
+      <p class="eyebrow">⚡ Main Tip</p>
+      <p class="rec-market">{mn["tip"]}</p>
+      <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:8px">
+        <p class="rec-pct">{mn["prob"]}%</p>
+        <div><p style="font-size:0.58rem;letter-spacing:1.5px;color:var(--t)">FAIR ODDS</p>
+          <p class="display" style="font-size:1.5rem">{mn["odds"]}</p></div>
+        {"<div>" + mn_edge_html + "</div>" if mn_edge_html else ""}
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <span style="font-size:0.6rem;color:var(--t);letter-spacing:1px">SIGNALS</span>
+        {agree_dots}
+        <span style="font-size:0.6rem;color:var(--t)">{mn["agree"]}/3 agree</span>
+      </div>
+      <p style="font-size:0.68rem;color:var(--t);line-height:1.5;border-top:1px solid var(--bdr);padding-top:8px">{mn["reason"]}</p>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+      <div class="card fu d2" style="margin:0;border-color:rgba(41,121,255,.2)">
+        <p class="eyebrow" style="color:var(--b)">Safe Bet</p>
+        <p class="display" style="font-size:1.1rem;margin:6px 0;line-height:1.2">{sf["tip"]}</p>
+        <p style="font-family:\'Bebas Neue\',sans-serif;font-size:1.6rem;color:var(--b)">{sf["prob"]}%</p>
+        <p style="font-size:0.62rem;color:var(--t);margin-top:2px">Odds {sf["odds"]} {"· " + sf_edge_html if sf_edge_html else ""}</p>
+        <p style="font-size:0.6rem;color:var(--t);margin-top:6px;line-height:1.4;border-top:1px solid var(--bdr);padding-top:6px">{sf["reason"][:80]}{"…" if len(sf["reason"])>80 else ""}</p>
+      </div>
+      <div class="card fu d2" style="margin:0;border-color:rgba(255,109,0,.2)">
+        <p class="eyebrow" style="color:var(--w)">Risky Combo</p>
+        <p class="display" style="font-size:0.9rem;margin:6px 0;line-height:1.3;color:var(--w)">{rk["tip"]}</p>
+        <p style="font-family:\'Bebas Neue\',sans-serif;font-size:1.6rem;color:var(--w)">{rk["prob"]}%</p>
+        <p style="font-size:0.62rem;color:var(--t);margin-top:2px">Combo odds {rk["odds"]}</p>
+        <p style="font-size:0.6rem;color:var(--t);margin-top:6px;line-height:1.4;border-top:1px solid var(--bdr);padding-top:6px">Joint probability — higher risk, higher reward</p>
+      </div>
+    </div>'''
     c += f'<div class="sgrid fu d2"><div class="sbox"><p class="sval g">{res["xg_h"]}</p><p class="slbl">xG {h.split()[0]}</p></div><div class="sbox"><p class="sval b">{res["xg_a"]}</p><p class="slbl">xG {a.split()[0]}</p></div></div>'
     c += f'<div class="card fu d2" style="text-align:center;padding:14px 18px"><p class="eyebrow">Most Likely Score</p><p class="display" style="font-size:2.4rem;margin-top:2px">{res["likely_score"]}</p></div>'
     c += f'<div class="card fu d2"><p class="sep" style="padding-top:0;margin-top:0">1 x 2</p>{prob_bar("Home Win",ox["home"])}{prob_bar("Draw",ox["draw"],"blue")}{prob_bar("Away Win",ox["away"],"warn")}</div>'
@@ -304,7 +340,7 @@ def match_display(match_id):
 
 @app.route("/acca")
 def acca():
-    data=api_get("/predictions/"); matches=data.get("results",[]); picks,combined=match_predictor.pick_acca(matches,n=5,min_prob=52.0)
+    data=api_get("/predictions/"); matches=data.get("results",[]); picks,combined=match_predictor.pick_acca(matches,n=5,min_conv=42.0)
     c='<div style="padding:28px 0 16px" class="fu"><p class="eyebrow">Daily Best Picks</p><h1 class="display" style="font-size:2.8rem;margin-top:4px">ACCA<br>BUILDER</h1></div>'
     if not picks:
         c+='<div class="empty">No qualifying picks today</div>'
@@ -312,8 +348,8 @@ def acca():
     c+='<div class="fix-wrap fu d1">'
     for p in picks:
         e=p["match"].get("event",{}); h,a=e.get("home_team","?"),e.get("away_team","?"); res=p["result"]; mid=p["match"].get("id",0)
-        l_info=LEAGUE_MAP.get(p["league_id"],{"icon":"—","name":""}); edge=res["rec"].get("edge")
-        c+=f'<a href="/match/{mid}" class="acca-row"><div><p style="font-size:0.58rem;color:var(--t);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:3px">{l_info.get("icon","—")} {l_info.get("name","")}</p><p class="acca-match">{h} vs {a}</p><p class="acca-mkt">{res["rec"]["t"]} · {res["rec"]["p"]}%{"  +"+str(edge)+"% edge" if edge and edge>0 else ""}</p></div><p class="acca-odds">{res["rec"]["odds"]}</p></a>'
+        l_info=LEAGUE_MAP.get(p["league_id"],{"icon":"—","name":""}); mn=res["main"]; edge=mn.get("edge")
+        c+=f'<a href="/match/{mid}" class="acca-row"><div><p style="font-size:0.58rem;color:var(--t);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:3px">{l_info.get("icon","—")} {l_info.get("name","")}</p><p class="acca-match">{h} vs {a}</p><p class="acca-mkt">{mn["tip"]} · {mn["prob"]}%{"  +" + str(edge) + "% edge" if edge and edge>0 else ""}</p><p style="font-size:0.6rem;color:var(--t);margin-top:3px">{mn["reason"][:60]}{"…" if len(mn["reason"])>60 else ""}</p></div><p class="acca-odds">{mn["odds"]}</p></a>'
     c+=f'</div><div class="rec-box fu d2" style="text-align:center;margin-top:12px"><p class="eyebrow">Combined Odds</p><p class="rec-pct" style="font-size:4rem">{combined}</p><p style="font-size:0.62rem;color:var(--t);margin-top:4px;letter-spacing:1px">{len(picks)}-FOLD ACCUMULATOR</p></div><p style="font-size:0.6rem;color:var(--t);text-align:center;padding:14px;letter-spacing:1px">Fair odds shown · Gamble responsibly</p>'
     return render_template_string(LAYOUT,content=c,page="acca")
 
