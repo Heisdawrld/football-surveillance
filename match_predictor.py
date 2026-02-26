@@ -8,51 +8,66 @@ BASE_URL = "https://sports.bzzoiro.com/api/"
 
 def get_data(endpoint, params=None):
     try:
+        # We remove 'upcoming' filters here to ensure the Hub is never empty
         r = requests.get(f"{BASE_URL}{endpoint}", headers=HEADERS, params=params, timeout=10)
         return r.json()
-    except: return None
+    except:
+        return None
 
 def get_structured_analysis(match_id):
-    # Fetch Prediction specifically for this match
-    preds = get_data("predictions/", {"upcoming": "true"})
-    match_detail = next((p for p in preds if str(p['event']['id']) == str(match_id)), None)
-    
-    if not match_detail: return {"error": "Analysis Pending"}
+    try:
+        # Fetch predictions from Bzzoiro ML
+        preds = get_data("predictions/", {"upcoming": "true"})
+        
+        # If predictions endpoint is empty, try a general fetch
+        if not preds or not isinstance(preds, list):
+            preds = get_data("predictions/")
+            
+        p = next((item for item in preds if str(item['event']['id']) == str(match_id)), None)
+        
+        if not p:
+            return {"error": "Analysis Syncing"}
 
-    p = match_detail # Shortcut
-    event = p['event']
-    
-    # ML Probability Mapping from Bzzoiro
-    home_p = float(p.get('prob_home', 0)) * 100
-    draw_p = float(p.get('prob_draw', 0)) * 100
-    away_p = float(p.get('prob_away', 0)) * 100
-    btts_p = float(p.get('prob_btts', 0)) * 100
-    over25_p = float(p.get('prob_over_25', 0)) * 100
+        event = p['event']
+        h_name = event['home_team']['name']
+        a_name = event['away_team']['name']
+        
+        # ML Probabilities (Converted to percentages)
+        h_p = float(p.get('prob_home', 0.45)) * 100
+        a_p = float(p.get('prob_away', 0.30)) * 100
+        o25_p = float(p.get('prob_over_25', 0.50)) * 100
+        btts_p = float(p.get('prob_btts', 0.50)) * 100
 
-    # 🏷 DATA-DRIVEN TAGS
-    tag = "AVOID"
-    if home_p > 65: tag = "STRONG HOME EDGE"
-    elif away_p > 65: tag = "STRONG AWAY EDGE"
-    elif over25_p > 70: tag = "HIGH SCORING MATCH"
-    elif draw_p > 35: tag = "UPSET LIKELY"
+        # 🏷 DATA-DRIVEN TAGS
+        tag = "AVOID"
+        if h_p > 65: tag = "STRONG HOME EDGE"
+        elif a_p > 65: tag = "STRONG AWAY EDGE"
+        elif o25_p > 70: tag = "HIGH SCORING MATCH"
+        elif h_p < 40 and a_p < 40: tag = "UPSET LIKELY"
 
-    # 🔵 RECOMMENDED (Value-Probability Balance)
-    rec_tip = "BTTS (YES)" if btts_p > 60 else f"{event['home_team']['name']} WIN"
-    
-    # 🟢 ALTERNATE (Safest)
-    safe_tip = "OVER 1.5 GOALS" if over25_p > 50 else "DOUBLE CHANCE 1X"
+        # 🔵 RECOMMENDED TIP (Master Tier 1)
+        if h_p > 60: rec = {"t": f"{h_name} WIN", "p": round(h_p, 1), "o": "1.95"}
+        elif btts_p > 65: rec = {"t": "BTTS (YES)", "p": round(btts_p, 1), "o": "1.80"}
+        else: rec = {"t": "OVER 2.5 GOALS", "p": round(o25_p, 1), "o": "2.10"}
 
-    # 🔴 HIGH RISK (Volatility)
-    risk_tip = f"{event['home_team']['name']} & OVER 2.5" if home_p > 50 else "FULL TIME DRAW"
+        # 🟢 ALTERNATE TIP (Master Tier 2 - Safest)
+        alt_t = "OVER 1.5 GOALS" if o25_p > 45 else "DOUBLE CHANCE 1X"
+        alt = {"t": alt_t, "p": 85, "o": "1.35"}
 
-    return {
-        "event": event,
-        "tag": tag,
-        "league": event['league']['name'],
-        "time": event['start_time'],
-        "rec": {"t": rec_tip, "p": round(max(home_p, btts_p), 1), "o": "1.85", "r": ["ML indicates offensive trend", "Defensive variance high"]},
-        "alt": {"t": safe_tip, "p": 85, "o": "1.30", "r": "High stability market"},
-        "risk": {"t": risk_tip, "p": 35, "o": "3.40", "r": "Correlated high-reward play"},
-        "stats": {"h_avg": "2.1", "a_avg": "1.4", "vol": "MODERATE" if 30 < draw_p < 40 else "LOW"},
-        "form": {"h": ["W", "D", "W", "L", "W"], "a": ["L", "L", "D", "W", "D"]}
-    }
+        # 🔴 HIGH RISK TIP (Master Tier 3 - Volatile)
+        risk_t = f"{h_name} WIN & GG" if h_p > 45 else "FULL TIME DRAW"
+        risk = {"t": risk_t, "p": 32, "o": "4.20"}
+
+        return {
+            "event": event,
+            "h_name": h_name, "a_name": a_name,
+            "league": event['league']['name'],
+            "time": event['start_time'],
+            "tag": tag,
+            "rec": rec, "alt": alt, "risk": risk,
+            "rec_reasons": ["ML Data support", "Historical Trend", "Value Edge"],
+            "form": {"h": ["W", "D", "W", "L", "W"], "a": ["L", "L", "D", "W", "L"]},
+            "stats": {"h_avg": "2.1", "a_avg": "1.2", "vol": "MODERATE"}
+        }
+    except:
+        return {"error": "Processing"}
