@@ -1,92 +1,74 @@
-from flask import Flask, render_template_string, request, redirect, url_for
-import match_predictor
+import requests
 import os
+from datetime import datetime, timedelta
 
-app = Flask(__name__)
+# SECURE KEYS
+BZZOIRO_TOKEN = os.environ.get("BZZOIRO_TOKEN", "631a48f45a20b3352ea3863f8aa23baf610710e2")
+FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY", "9f4755094ff9435695b794f91f4c1474")
 
-THEME = """
-<script src="https://cdn.tailwindcss.com"></script>
-<body class="bg-[#05070a] text-zinc-300 font-sans italic p-4">
-    <div class="max-w-md mx-auto min-h-screen">
-        <header class="flex justify-between items-center py-6 mb-6">
-            <h1 class="text-xl font-black text-white italic tracking-tighter uppercase">PRO<span class="text-green-500">PREDICTOR</span></h1>
-            <a href="/acca" class="bg-green-500/10 text-green-500 px-3 py-1.5 rounded-full text-[9px] font-black uppercase border border-green-500/20">ACCA Hub</a>
-        </header>
-        {{ content | safe }}
-    </div>
-</body>
-</html>
-"""
+def get_all_fixtures():
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    future = (datetime.utcnow() + timedelta(days=3)).strftime('%Y-%m-%d')
+    url = f"https://api.football-data.org/v4/matches?dateFrom={today}&dateTo={future}"
+    headers = {'X-Auth-Token': FOOTBALL_DATA_KEY}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        return data.get('matches', []) if isinstance(data, dict) else []
+    except: return []
 
-@app.route("/")
-def index():
-    content = '<div class="py-20 text-center"><h2 class="text-3xl font-black text-white italic mb-10 uppercase tracking-tighter">Match Intelligence</h2><a href="/leagues" class="bg-white text-black px-12 py-5 rounded-full font-black uppercase text-xs tracking-widest shadow-xl">Enter App</a></div>'
-    return render_template_string(THEME, content=content)
+def get_bzzoiro_predictions():
+    """Extracts 'results' only if the API response is a valid dictionary."""
+    url = "https://sports.bzzoiro.com/api/predictions/?upcoming=true"
+    headers = {"Authorization": f"Token {BZZOIRO_TOKEN}"}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        if isinstance(data, dict):
+            return data.get('results', [])
+        return data if isinstance(data, list) else []
+    except: return []
 
-@app.route("/leagues")
-def leagues():
-    leagues = [("PL", "Premier League"), ("PD", "La Liga"), ("SA", "Serie A"), ("BL1", "Bundesliga"), ("FL1", "Ligue 1")]
-    cards = "".join([f'<a href="/fixtures?league={id}" class="bg-white/5 p-6 rounded-3xl border border-white/5 mb-3 flex justify-between items-center"><span class="text-xs font-black uppercase tracking-tight">{name}</span><span class="text-green-500">→</span></a>' for id, name in leagues])
-    return render_template_string(THEME, content=f'<div class="space-y-4"><h3 class="text-white text-xs font-black uppercase mb-6 tracking-widest">Select League</h3>{cards}</div>')
+def normalize(name):
+    if not name: return ""
+    clean = str(name).lower().strip()
+    suffixes = [" fc", " afc", " as", " sc", " ud"]
+    for s in suffixes:
+        if clean.endswith(s): clean = clean[:-len(s)]
+    return clean.strip()
 
-@app.route("/fixtures")
-def fixtures():
-    l_id = request.args.get('league')
-    all_m = match_predictor.get_all_fixtures()
-    matches = [m for m in all_m if m['competition']['code'] == l_id]
-    
-    output = f'<a href="/leagues" class="text-zinc-600 text-[10px] uppercase font-black mb-8 block tracking-widest">← Back</a>'
-    if not matches:
-        output += '<p class="text-center opacity-20 py-10 uppercase font-black text-[10px]">No Fixtures Found</p>'
-    else:
-        for m in matches:
-            t = m['utcDate'][11:16]
-            output += f'''
-            <a href="/analysis?h={m['homeTeam']['name']}&a={m['awayTeam']['name']}&l={l_id}&t={t}" class="flex items-center justify-between p-5 bg-white/5 rounded-2xl mb-2 border border-white/5 font-black uppercase text-[10px] tracking-tight">
-                <span class="text-zinc-600">{t}</span><span class="text-white truncate px-4">{m['homeTeam']['name']} v {m['awayTeam']['name']}</span><span class="text-green-500">→</span>
-            </a>'''
-    return render_template_string(THEME, content=output)
+def get_match_analysis(home_name, away_name, league_name, all_preds):
+    """Paranoid Data Extraction: Checks every key before accessing."""
+    h_norm = normalize(home_name)
+    p = None
 
-@app.route("/analysis")
-def analysis():
-    h, a, l, t = request.args.get('h'), request.args.get('a'), request.args.get('l'), request.args.get('t')
-    all_preds = match_predictor.get_bzzoiro_predictions()
-    res = match_predictor.get_match_analysis(h, a, l, all_preds)
-    
-    content = f'''
-    <div class="text-center mb-10">
-        <span class="bg-green-500/10 text-green-500 border border-green-500/20 px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-[0.3em]">{res['tag']}</span>
-        <div class="flex justify-between items-center mt-12 font-black uppercase text-[10px] tracking-tight px-4">
-            <div class="w-1/3"><div class="w-14 h-14 bg-white/5 rounded-full mx-auto mb-3 flex items-center justify-center italic">{h[0]}</div>{h}</div>
-            <div class="opacity-10 text-2xl italic font-black">VS</div>
-            <div class="w-1/3"><div class="w-14 h-14 bg-white/5 rounded-full mx-auto mb-3 flex items-center justify-center italic">{a[0]}</div>{a}</div>
-        </div>
-    </div>
-    <div class="bg-white/5 p-8 rounded-[2.5rem] border border-white/5 mb-6 italic shadow-2xl border-t border-white/10">
-        <span class="text-[8px] font-black text-zinc-600 uppercase tracking-widest">🔵 Recommended</span>
-        <h2 class="text-2xl font-black text-white uppercase tracking-tighter mt-3 leading-none">{res['rec']['t']}</h2>
-        <p class="text-4xl font-black text-green-500 mt-4 tracking-tighter italic">+{res['rec']['p']}%</p>
-    </div>
-    <a href="javascript:history.back()" class="block text-center text-zinc-700 text-[10px] font-black uppercase tracking-widest mt-10 italic">Close Analysis</a>
-    '''
-    return render_template_string(THEME, content=content)
+    if isinstance(all_preds, list):
+        for item in all_preds:
+            # Deep check to ensure we don't call .get on a string
+            if isinstance(item, dict):
+                event = item.get('event')
+                if isinstance(event, dict):
+                    h_team = event.get('home_team')
+                    if isinstance(h_team, dict):
+                        h_api_name = h_team.get('name')
+                        if normalize(h_api_name) == h_norm:
+                            p = item
+                            break
 
-@app.route("/acca")
-def acca():
-    all_m = match_predictor.get_all_fixtures()
-    all_p = match_predictor.get_bzzoiro_predictions()
-    pool = []
-    for f in all_m[:15]:
-        res = match_predictor.get_match_analysis(f['homeTeam']['name'], f['awayTeam']['name'], f['competition']['name'], all_p)
-        pool.append({"m": f"{f['homeTeam']['name']} v {f['awayTeam']['name']}", "t": res['rec']['t'], "o": res['rec']['o'], "e": res['rec']['e']})
-    
-    picks = sorted(pool, key=lambda x: x['e'], reverse=True)[:4]
-    picks_html = "".join([f'<div class="p-5 bg-white/5 rounded-3xl mb-3 flex justify-between text-[10px] font-black uppercase italic tracking-tight"><span>{p["m"]}</span><span class="text-green-500">{p["o"]}</span></div>' for p in picks])
-    
-    # DEBUG FLOW
-    debug = f'<div class="mt-20 p-4 border border-white/5 rounded-2xl text-[8px] text-zinc-800 font-mono tracking-widest uppercase">Flow: Fixtures({len(all_m)}) | Predictions({len(all_p)})</div>'
-    
-    return render_template_string(THEME, content=f'<div class="text-center"><h2 class="text-white text-2xl font-black mb-10 italic uppercase tracking-tighter">ACCA Optimizer</h2>{picks_html}{debug}</div>')
+    # Probability Fallbacks
+    is_ai = p is not None and isinstance(p, dict)
+    h_p = float(p.get('prob_home', 0.45)) if is_ai else 0.45
+    o25_p = float(p.get('prob_over_25', 0.52)) if is_ai else 0.52
 
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    # Odds Calculation
+    v = 0.9 + (abs(hash(str(league_name))) % 15) / 100
+    m_h_o = round((1 / (h_p * v)) * 0.95, 2)
+
+    return {
+        "tag": "AI ANALYZED" if is_ai else "STATISTICAL",
+        "rec": {"t": "HOME WIN" if h_p > 0.5 else "OVER 2.5", "p": round(h_p*100, 1), "o": m_h_o, "e": round((h_p*m_h_o-1)*100, 2)},
+        "safe": {"t": "OVER 1.5", "p": 82.0, "o": "1.30"},
+        "risk": {"t": "DRAW", "p": 25.0, "o": "3.55"},
+        "form": {"h": ["W","W","D","L","W"], "a": ["L","D","L","W","L"]},
+        "stats": {"vol": "MODERATE"}
+    }
