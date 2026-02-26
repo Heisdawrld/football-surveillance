@@ -116,21 +116,48 @@ def fetch_all_predictions():
     return all_matches
 
 def fetch_league_matches(l_id):
-    """Fetch predictions filtered by league ID."""
+    """
+    Fetch predictions filtered STRICTLY by league ID.
+    Double-check: league id must match exactly.
+    Never allow a match from league 32 to appear in league 17.
+    """
     all_matches = fetch_all_predictions()
-    return [m for m in all_matches
-            if m.get("event",{}).get("league",{}).get("id") == l_id]
+    result = []
+    for m in all_matches:
+        event  = m.get("event", {})
+        league = event.get("league", {})
+        # Strict match — both id AND the id must equal exactly
+        match_lid = league.get("id")
+        if match_lid == l_id:
+            result.append(m)
+    return result
 
 # ── Date / time ───────────────────────────────────────────────────────────────
 
 def parse_dt(raw):
+    """
+    Parse event datetime from API. Tries:
+    1. Unix timestamp (integer seconds)
+    2. ISO format string
+    Always returns WAT (UTC+1) timezone.
+    """
+    if not raw:
+        return datetime.now(tz=timezone.utc) + timedelta(hours=WAT_OFFSET)
     try:
-        dt = datetime.fromisoformat(raw)
+        # If it's a unix timestamp (integer or numeric string)
+        ts = int(float(str(raw)))
+        if ts > 1000000000:  # sanity check — valid unix timestamp
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            return dt + timedelta(hours=WAT_OFFSET)
+    except (ValueError, TypeError):
+        pass
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc) + timedelta(hours=WAT_OFFSET)
     except:
-        return datetime.now(tz=timezone.utc)
+        return datetime.now(tz=timezone.utc) + timedelta(hours=WAT_OFFSET)
 
 def now_wat():
     return datetime.now(tz=timezone.utc) + timedelta(hours=WAT_OFFSET)
@@ -140,7 +167,9 @@ def group_by_date(matches):
     tomorrow = today + timedelta(days=1)
     groups   = {}
     for m in matches:
-        dt  = parse_dt(m.get("event",{}).get("event_date",""))
+        e   = m.get("event", {})
+        raw = e.get("event_timestamp") or e.get("event_date","")
+        dt  = parse_dt(raw)
         d   = dt.date()
         if d == today:           key = "TODAY"
         elif d == tomorrow:      key = "TOMORROW"
@@ -162,6 +191,15 @@ def group_by_date(matches):
     return ordered
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
+
+def _quick_sure(m):
+    """Quick check if a match qualifies as SURE MATCH — for tile badges."""
+    try:
+        h_win = float(m.get("prob_home_win", 0))
+        a_win = float(m.get("prob_away_win", 0))
+        return max(h_win, a_win) >= 85
+    except:
+        return False
 
 def form_dot(r):
     r   = r.upper()
@@ -242,6 +280,9 @@ nav{position:sticky;top:0;z-index:200;background:rgba(5,8,13,.9);backdrop-filter
 .badge-muted{background:rgba(122,135,153,.07);color:var(--t);border:1px solid var(--bdr)}
 .badge-red{background:rgba(244,67,54,.1);color:var(--r);border:1px solid rgba(244,67,54,.2)}
 .badge-pu{background:rgba(168,85,247,.1);color:var(--pu);border:1px solid rgba(168,85,247,.2)}
+.badge-sure{background:rgba(0,230,118,.15);color:var(--g);border:1px solid rgba(0,230,118,.35);font-size:.62rem}
+.badge-avoid{background:rgba(244,67,54,.12);color:var(--r);border:1px solid rgba(244,67,54,.3);font-size:.62rem}
+.badge-reliable{background:rgba(79,142,247,.12);color:var(--b);border:1px solid rgba(79,142,247,.3);font-size:.62rem}
 
 /* TYPOGRAPHY */
 .eyebrow{font-size:.56rem;font-weight:600;letter-spacing:2px;text-transform:uppercase;color:var(--t);margin-bottom:4px}
@@ -581,8 +622,15 @@ def index():
             count = league_counts.get(l["id"], 0)
             no_cls = " no-matches" if count == 0 else ""
             count_badge = f'<span class="tile-count">{count}</span>' if count > 0 else ""
+            sure_count = sum(1 for mm in all_matches
+                if mm.get("event",{}).get("league",{}).get("id") == l["id"]
+                and _quick_sure(mm))
+            sure_badge = (f'<span style="position:absolute;bottom:10px;right:10px;'
+                          f'font-size:.56rem;color:var(--g)">✅ {sure_count}</span>'
+                          if sure_count > 0 else "")
             c += f'''<a href="/league/{l["id"]}" class="league-tile{no_cls}" data-name="{l["name"].lower()} {l["country"].lower()}">
               {count_badge}
+              {sure_badge}
               <span class="tile-icon">{l["icon"]}</span>
               <div class="tile-name">{l["name"]}</div>
               <div class="tile-country">{l["country"]}</div>
@@ -623,6 +671,9 @@ def league_page(l_id):
         h   = e.get("home_team","?")
         a   = e.get("away_team","?")
         mid = m.get("id", 0)
+        # Use unix timestamp for accurate kickoff time if available
+        raw_ts = e.get("event_timestamp") or e.get("event_date","")
+        dt = parse_dt(raw_ts)
         res = match_predictor.analyze_match(m, l_id)
         tip = res["recommended"]["tip"] if res else "—"
         tip_c = tip_color(tip)
@@ -783,7 +834,7 @@ def match_display(match_id):
       <div class="tier-box safe">
         <p class="tier-label" style="color:var(--b)">🛡 Safest Bet</p>
         <p class="tier-tip">{safe["tip"]}</p>
-        <p class="tier-pct" style="color:var(--b)">{safe["prob"]}%</p>
+        <p class="tier-pct" style="color:var(--b)">{round(safe["prob"], 1)}%</p>
         {safe_odds_str}
       </div>
       <div class="tier-box risky">
