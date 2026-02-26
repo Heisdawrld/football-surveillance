@@ -5,6 +5,34 @@ prob_home_win, prob_draw, prob_away_win, prob_over_15/25/35, prob_btts_yes
 Adds: momentum score, upset index, value edge vs bookmaker odds
 """
 
+import math
+
+def poisson_pmf(k, lam):
+    """P(X = k) for Poisson distribution."""
+    if lam <= 0:
+        return 1.0 if k == 0 else 0.0
+    return (lam ** k) * math.exp(-lam) / math.factorial(k)
+
+def calculate_likely_score(h_xg, a_xg, over_15_prob=50, max_goals=6):
+    """
+    Calculate most likely score from xG using Poisson.
+    When Over 1.5 is highly probable but 0-0 is peak Poisson prob,
+    return the most likely SCORING scoreline instead — avoids contradiction.
+    """
+    scores = []
+    for h in range(max_goals + 1):
+        for a in range(max_goals + 1):
+            p = poisson_pmf(h, h_xg) * poisson_pmf(a, a_xg)
+            scores.append((p, h, a))
+    scores.sort(reverse=True)
+    best_p, best_h, best_a = scores[0]
+    # If 0-0 leads but Over 1.5 says goals are very likely, show best scoring line
+    if best_h == 0 and best_a == 0 and over_15_prob >= 65:
+        for p, h, a in scores:
+            if h + a >= 1:
+                return f"{h}-{a}"
+    return f"{best_h}-{best_a}"
+
 FORM_WEIGHTS = [1.0, 1.2, 1.4, 1.6, 1.8]
 FORM_VALUE   = {"W": 1.0, "D": 0.4, "L": 0.0}
 
@@ -120,7 +148,8 @@ def analyze_match(api_data, league_id=None):
         h_xg   = float(api_data.get("expected_home_goals", 1.2))
         a_xg   = float(api_data.get("expected_away_goals", 1.0))
         conf   = float(api_data.get("confidence",     40.0))
-        likely = api_data.get("most_likely_score", "?-?")
+        # Calculate most likely score from xG — ignore API's field (often wrong)
+        likely = calculate_likely_score(h_xg, a_xg, o15)
 
         odds_h    = event.get("odds_home")
         odds_d    = event.get("odds_draw")
