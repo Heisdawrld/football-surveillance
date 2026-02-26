@@ -7,60 +7,37 @@ def get_match_analysis(match_id):
     headers = {'Authorization': f'Token {BSD_TOKEN}'}
     try:
         p_res = requests.get(f"{BASE_URL}/predictions/{match_id}/", headers=headers).json()
-        event = p_res.get('event', {})
-        
-        # CORE DATA
-        h_p = float(p_res.get('prob_home_win', 0))
-        a_p = float(p_res.get('prob_away_win', 0))
-        d_p = float(p_res.get('prob_draw', 0))
-        o25_p = float(p_res.get('prob_over_25', 0))
-        btts_p = float(p_res.get('prob_btts', 0))
+        e = p_res.get('event', {})
+        h_p, a_p, d_p = float(p_res.get('prob_home_win', 0)), float(p_res.get('prob_away_win', 0)), float(p_res.get('prob_draw', 0))
+        o25_p, btts_p = float(p_res.get('prob_over_25', 0)), float(p_res.get('prob_btts', 0))
 
-        # INTENTIONAL COMBO & MARKET ANALYTICS
-        fh_draw_prob = d_p * 1.15  # Statistically 1st half draws are higher frequency
-        
-        # SELECTION LOGIC
-        if h_p > 65 and o25_p > 50:
-            main_tip = f"{event.get('home_team')} & Over 1.5"
-            conf = (h_p + o25_p) / 2
-            reasons = ["Dominant home form detected", "High conversion in final third", "Strategic goal-line advantage"]
-        elif btts_p > 68:
-            main_tip = "BTTS (Yes)"
-            conf = btts_p
-            reasons = ["Both sides showing defensive gaps", "Aggressive attacking transitions", "Recent scoring trends align"]
-        elif fh_draw_prob > 52:
-            main_tip = "1st Half: Draw"
-            conf = fh_draw_prob
-            reasons = ["Cautious opening tactical play", "Midfield deadlock anticipated", "Low early-risk probability"]
-        else:
-            main_tip = "Double Chance: 1X" if h_p > a_p else "Double Chance: X2"
-            conf = max(h_p, a_p) + 12
-            reasons = ["Statistical safety prioritized", "Defensive stability confirmed"]
+        # 1. PRIMARY PREDICTION (Sensible Value Tip)
+        if h_p > 60 and o25_p > 55: main_tip, tag = f"{e.get('home_team')} & Over 1.5", "HOME DOMINANCE"
+        elif a_p > 60 and o25_p > 55: main_tip, tag = f"{e.get('away_team')} & Over 1.5", "AWAY DOMINANCE"
+        elif btts_p > 65: main_tip, tag = "BTTS (YES)", "ATTACKING OVERLOAD"
+        elif o25_p > 70: main_tip, tag = "OVER 2.5 GOALS", "HIGH SCORING MATCH"
+        elif o25_p < 35: main_tip, tag = "UNDER 2.5 GOALS", "DEFENSIVE DEADLOCK"
+        else: main_tip, tag = "DRAW NO BET: 1" if h_p > a_p else "DRAW NO BET: 2", "VALUE SECURED"
 
-        # HIGH-VALUE SNIPER (Intentional High Risk)
-        if btts_p > 60 and o25_p > 60:
-            risky = "GG & Over 2.5"
-        elif h_p > 40 and a_p > 40:
-            risky = "Full Time: Draw"
-        else:
-            risky = "Home Win to Nil" if h_p > 60 else "Correct Score: 1-1"
+        # 2. SAFEST ALTERNATIVE (Low Risk)
+        if o25_p > 45: safer = "OVER 1.5 GOALS"
+        elif h_p > a_p: safer = "DOUBLE CHANCE: 1X"
+        else: safer = "DOUBLE CHANCE: X2"
+
+        # 3. HIGH RISK (Strategic Combo/Straight)
+        if h_p > 50 and btts_p > 55: risky = f"{e.get('home_team')} WIN & GG"
+        elif a_p > 50 and btts_p > 55: risky = f"{e.get('away_team')} WIN & GG"
+        elif h_p > 55 and o25_p > 60: risky = f"{e.get('home_team')} WIN & OVER 2.5"
+        elif a_p > 55 and o25_p > 60: risky = f"{e.get('away_team')} WIN & OVER 2.5"
+        elif abs(h_p - a_p) < 5: risky = "FULL TIME DRAW"
+        else: risky = "WIN EITHER HALF: HOME" if h_p > a_p else "WIN EITHER HALF: AWAY"
 
         return {
-            "h_name": event.get('home_team', 'Home'),
-            "a_name": event.get('away_team', 'Away'),
-            "league": event.get('league_name', 'League'),
-            "difficulty": "Moderate" if abs(h_p - a_p) < 15 else "Clear Advantage",
-            "best_tip": {"t": main_tip, "p": conf, "risk": "Low" if conf > 75 else "Medium", "reasons": reasons},
-            "h_mom": "🔥 High" if h_p > 55 else "⚖️ Neutral",
-            "a_mom": "🔥 High" if a_p > 55 else "⚖️ Neutral",
-            "safer": "Over 1.5 Goals" if o25_p > 48 else "Double Chance",
-            "risky": risky,
-            "intel": {
-                "btts_prob": f"{btts_p:.0f}%",
-                "1st_half_draw": f"{fh_draw_prob:.0f}%",
-                "over_1.5": f"{(o25_p + 18):.0f}%",
-                "draw_risk": f"{d_p:.0f}%"
-            }
+            "h_name": e.get('home_team'), "a_name": e.get('away_team'),
+            "league": e.get('league_name'), "tag": tag,
+            "best_tip": {"t": main_tip, "p": max(h_p, a_p, o25_p)},
+            "safer": safer, "risky": risky,
+            "form": ["W", "D", "W", "L", "W"], # Placeholder for Last 5
+            "intel": {"BTTS": f"{btts_p:.0f}%", "O/U 2.5": f"{o25_p:.0f}%", "1ST H. OVER 0.5": f"{(o25_p*0.7):.0f}%"}
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except: return {"error": "sync"}
