@@ -72,68 +72,51 @@ def run_morning_job():
 
     saved = 0; skipped = 0; errors = 0
 
+    import sportmonks as sm
     for m in all_matches:
         try:
-            event    = m.get("event", {})
-            raw_ts   = event.get("event_timestamp") or event.get("event_date","")
-            if not raw_ts:
-                continue
-
-            # Parse date
-            try:
-                if isinstance(raw_ts, (int, float)):
-                    match_dt = datetime.fromtimestamp(raw_ts, tz=timezone.utc)
-                else:
-                    raw_ts = str(raw_ts).replace("Z","+00:00")
-                    match_dt = datetime.fromisoformat(raw_ts)
-                    if match_dt.tzinfo is None:
-                        match_dt = match_dt.replace(tzinfo=timezone.utc)
-            except:
-                continue
-
-            match_date_wat = (match_dt + timedelta(hours=WAT_OFFSET)).date()
-
-            # Only today and tomorrow
-            if match_date_wat not in (today_wat, tomorrow_wat):
-                continue
-
             match_id = m.get("id")
-            if not match_id:
-                continue
+            if not match_id: continue
 
-            league   = event.get("league", {})
-            l_id     = league.get("id", 0)
-            l_name   = league.get("name", "")
-            h        = event.get("home_team", "Home")
-            a        = event.get("away_team", "Away")
+            h_id, h_name, a_id, a_name = sm.extract_teams(m)
+            if not h_name: continue
 
-            # Run prediction (no enrichment -- saves API quota)
-            res = match_predictor.analyze_match(m, l_id, None)
-            if not res:
-                errors += 1
-                continue
+            league = m.get("league") or {}
+            l_id   = league.get("id",0) if isinstance(league,dict) else 0
+            l_name = league.get("name","") if isinstance(league,dict) else ""
+            raw_ko = m.get("starting_at") or m.get("date","")
 
-            rec = res["recommended"]
+            # Get Sportmonks predictions
+            preds_raw = sm.get_predictions(match_id)
+            preds = sm.parse_predictions(preds_raw) if preds_raw else {}
 
-            # Save to DB (INSERT OR IGNORE -- won't overwrite existing)
+            hw   = preds.get("home_win", 33.3)
+            dw   = preds.get("draw", 33.3)
+            aw   = preds.get("away_win", 33.3)
+            o25  = preds.get("over_25", 45.0)
+            btts = preds.get("btts", 45.0)
+
+            best = max([("HOME WIN",hw),("DRAW",dw),("AWAY WIN",aw),
+                        ("OVER 2.5",o25),("GG",btts)], key=lambda x: x[1])
+            tip, prob = best
+            fair_odds = round(100/max(prob,1), 2)
+
+            try:
+                match_dt = datetime.fromisoformat(
+                    str(raw_ko).replace("Z","+00:00"))
+                if match_dt.tzinfo is None:
+                    match_dt = match_dt.replace(tzinfo=timezone.utc)
+            except:
+                match_dt = datetime.now(timezone.utc)
+
             database.log_prediction(
-                match_id        = match_id,
-                league_id       = l_id,
-                league_name     = l_name,
-                home_team       = h,
-                away_team       = a,
-                match_date      = match_dt.strftime("%Y-%m-%d %H:%M"),
-                market          = rec["tip"],
-                probability     = rec["prob"],
-                fair_odds       = rec["odds"],
-                bookie_odds     = None,
-                edge            = rec.get("edge"),
-                confidence      = res["confidence"],
-                xg_home         = res["xg_h"],
-                xg_away         = res["xg_a"],
-                likely_score    = "",
-                tag             = res.get("tag",""),
-                reliability_score = res.get("confidence", 50)
+                match_id=match_id, league_id=l_id, league_name=l_name,
+                home_team=h_name or "Home", away_team=a_name or "Away",
+                match_date=match_dt.strftime("%Y-%m-%d %H:%M"),
+                market=tip, probability=prob, fair_odds=fair_odds,
+                bookie_odds=None, edge=None, confidence=prob,
+                xg_home=None, xg_away=None, likely_score="",
+                tag="MONITOR", reliability_score=prob
             )
             saved += 1
 
@@ -172,30 +155,23 @@ def run_settlement_job():
     # Group by match_id to avoid duplicate API calls
     match_ids = list(set(p["match_id"] for p in pending))
 
+    import sportmonks as sm
     for match_id in match_ids:
         try:
-            data = _bzz_get(f"/predictions/{match_id}/")
+            data = sm.get_fixture_detail(match_id)
             if not data:
                 not_ready += 1
                 continue
 
-            event  = data.get("event", {})
-            status = event.get("status", "").lower()
+            status = sm.extract_state(data)
 
             # Only settle finished matches
-            if status not in ("ft", "finished", "aet", "pen", "awarded"):
+            if status.upper() not in ("FT","AET","PEN","FIN","FINISHED","AWARDED"):
                 not_ready += 1
                 continue
 
             # Get final score
-            h_score = event.get("home_score") or event.get("ft_home_score")
-            a_score = event.get("away_score") or event.get("ft_away_score")
-
-            # Try nested score object
-            if h_score is None:
-                score = event.get("score", {})
-                h_score = score.get("home") or score.get("ft_home")
-                a_score = score.get("away") or score.get("ft_away")
+            h_score, a_score = sm.extract_score(data)
 
             if h_score is None or a_score is None:
                 not_ready += 1
