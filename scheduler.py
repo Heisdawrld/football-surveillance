@@ -212,8 +212,8 @@ def run_settlement_job():
                 )
                 settled += 1
 
-            # Update team memory after settlement
-            _update_team_memory(data, markets_for_match)
+            # Update team memory with real scores
+            _update_team_memory(data, markets_for_match, h_score, a_score)
 
             time.sleep(0.1)  # be gentle with the API
 
@@ -232,28 +232,47 @@ def run_settlement_job():
     return result
 
 
-def _update_team_memory(match_data, settled_markets):
+def _update_team_memory(match_data, settled_markets, h_score, a_score):
     """
-    After a match settles, update team memory in DB.
-    Stores per-team historical accuracy for calibration.
+    After a match settles, record REAL performance for both teams.
+    Arsenal 3-1 Wolves:
+      Arsenal  -> home WIN, scored 3, conceded 1
+      Wolves   -> away LOSS, scored 1, conceded 3
+    This is the real team intelligence -- not prediction accuracy.
     """
     import database
 
-    event  = match_data.get("event", {})
-    h_team = event.get("home_team","")
-    a_team = event.get("away_team","")
-    league = event.get("league",{}).get("name","")
+    event      = match_data.get("event", {})
+    h_team     = event.get("home_team","")
+    a_team     = event.get("away_team","")
+    league     = event.get("league",{}).get("name","")
+    raw_date   = event.get("event_date","")[:10]
 
     if not h_team or not a_team:
         return
 
-    for market_row in settled_markets:
-        result = market_row.get("result")
-        market = market_row.get("market","")
-        prob   = market_row.get("probability", 50)
+    try:
+        database.update_team_memory(
+            home_team   = h_team,
+            away_team   = a_team,
+            league      = league,
+            home_score  = int(h_score),
+            away_score  = int(a_score),
+            match_date  = raw_date
+        )
+        print(f"[memory] {h_team} {h_score}-{a_score} {a_team} -> stored")
+    except Exception as e:
+        print(f"[memory] error: {e}")
 
-        if result not in ("WIN","LOSS"):
-            continue
-
-        win = 1 if result == "WIN" else 0
-        database.update_team_memory(h_team, a_team, league, market, prob, win)
+    # Also update market calibration (global hit rates per market type)
+    try:
+        for market_row in settled_markets:
+            result = market_row.get("result")
+            market = market_row.get("market","")
+            prob   = market_row.get("probability", 50)
+            if result not in ("WIN","LOSS"):
+                continue
+            win = 1 if result == "WIN" else 0
+            database.update_market_calibration(market, prob, win)
+    except Exception as e:
+        print(f"[memory] calibration error: {e}")
