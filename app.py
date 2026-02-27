@@ -1,7 +1,7 @@
 from flask import Flask, render_template_string, request, jsonify
 import requests, os, math, json
 from datetime import datetime, timedelta, timezone
-import match_predictor, database, external_data
+import match_predictor, database, external_data, scheduler
 
 app = Flask(__name__)
 database.init_db()
@@ -732,7 +732,12 @@ LAYOUT = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<link rel="manifest" href="/manifest.json">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="ProPred">
+    <meta name="theme-color" content="#00e676">
+    <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>ProPred NG</title>
 <style>""" + CSS + """</style>
 </head>
@@ -1618,6 +1623,34 @@ def api_leagues():
     return jsonify(_LEAGUE_REGISTRY)
 
 
+# -- AUTONOMOUS PIPELINE ROUTES ------------------------------------------------
+
+@app.route("/api/morning")
+def api_morning():
+    """
+    Morning job -- predict every match today + tomorrow.
+    Call once at 6am WAT via Render Cron: 0 5 * * *
+    curl https://your-site.onrender.com/api/morning
+    """
+    result = scheduler.run_morning_job()
+    return jsonify(result)
+
+@app.route("/api/settle")
+def api_settle():
+    """
+    Settlement job -- settle all finished matches.
+    Call every 3 hours via Render Cron: 0 */3 * * *
+    curl https://your-site.onrender.com/api/settle
+    """
+    result = scheduler.run_settlement_job()
+    return jsonify(result)
+
+@app.route("/api/calibration")
+def api_calibration():
+    """Show current market calibration data."""
+    cal = database.get_market_calibration()
+    return jsonify({"calibration": cal, "markets": len(cal)})
+
 # -- BATCH JOB + QUOTA MONITOR -------------------------------------------------
 
 @app.route("/api/batch")
@@ -1645,6 +1678,26 @@ def api_batch():
         "calls_skipped":result["calls_skipped"],
         "quota":        quota,
     })
+
+@app.route("/manifest.json")
+def pwa_manifest():
+    """PWA manifest -- makes site installable as iPhone app."""
+    manifest = {
+        "name": "ProPred NG",
+        "short_name": "ProPred",
+        "description": "Football Prediction Intelligence",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#0a0a0f",
+        "theme_color": "#00e676",
+        "orientation": "portrait",
+        "icons": [
+            {"src": "/static/icon.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/static/icon.png", "sizes": "512x512", "type": "image/png"}
+        ]
+    }
+    from flask import Response
+    return Response(json.dumps(manifest), mimetype="application/json")
 
 @app.route("/api/quota")
 def api_quota():
