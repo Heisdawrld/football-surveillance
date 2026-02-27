@@ -113,6 +113,7 @@ def get_standings_fdorg(our_league_id):
         return None
     if table:
         database.cache_set("h2h_cache", ck, json.dumps(table))
+    _mem_set(ck, json.dumps(table))
     return table if table else None
 
 def get_team_last_matches_fdorg(team_fdorg_id, our_league_id, last=5):
@@ -151,6 +152,7 @@ def get_team_last_matches_fdorg(team_fdorg_id, our_league_id, last=5):
     matches.sort(key=lambda x: x["date"], reverse=True)
     if matches:
         database.cache_set("h2h_cache", ck, json.dumps(matches))
+    _mem_set(ck, json.dumps(matches))
     return matches
 
 
@@ -171,6 +173,28 @@ POSITION_WEIGHTS = {
 
 # In-memory quota tracker
 _quota = {"date": "", "count": 0}
+
+# In-memory cache -- survives within a single server session
+# Key: cache_key string -> (data, timestamp)
+# This means repeat page loads within the same Render session = 0 API calls
+_mem_cache = {}
+
+def _mem_get(key, max_age_hours=24):
+    """Check in-memory cache first before hitting SQLite."""
+    if key not in _mem_cache:
+        return None
+    data, ts = _mem_cache[key]
+    from datetime import datetime, timezone, timedelta
+    age = datetime.now(timezone.utc) - ts
+    if age > timedelta(hours=max_age_hours):
+        del _mem_cache[key]
+        return None
+    return data
+
+def _mem_set(key, data):
+    """Store in memory cache."""
+    from datetime import datetime, timezone
+    _mem_cache[key] = (data, datetime.now(timezone.utc))
 
 # -- Core API caller -----------------------------------------------------------
 
@@ -455,8 +479,11 @@ def run_daily_batch(today_matches):
 def get_h2h(home_api_id, away_api_id, last=8):
     if not home_api_id or not away_api_id: return []
     ck = f"h2h_{min(home_api_id,away_api_id)}_{max(home_api_id,away_api_id)}"
+    mem = _mem_get(ck, 24)
+    if mem: return json.loads(mem)
     cached = database.cache_get("h2h_cache", ck, max_age_hours=24)
     if cached:
+        _mem_set(ck, cached)
         try: return json.loads(cached)
         except: pass
     data = _get("/fixtures/headtohead",
@@ -478,6 +505,7 @@ def get_h2h(home_api_id, away_api_id, last=8):
             "status":     fix.get("status",{}).get("short",""),
         })
     database.cache_set("h2h_cache", ck, json.dumps(results))
+    _mem_set(ck, json.dumps(results))
     return results
 
 def summarise_h2h(h2h_list, home_name, away_name):
@@ -509,8 +537,11 @@ def summarise_h2h(h2h_list, home_name, away_name):
 def get_last_matches(team_api_id, last=5):
     if not team_api_id: return []
     ck = f"last_{team_api_id}_{last}"
+    mem = _mem_get(ck, 6)
+    if mem: return json.loads(mem)
     cached = database.cache_get("h2h_cache", ck, max_age_hours=6)
     if cached:
+        _mem_set(ck, cached)
         try: return json.loads(cached)
         except: pass
     data = _get("/fixtures", {"team": team_api_id, "last": last, "status": "FT"})
@@ -529,6 +560,7 @@ def get_last_matches(team_api_id, last=5):
         })
     matches.sort(key=lambda x: x["date"], reverse=True)
     database.cache_set("h2h_cache", ck, json.dumps(matches))
+    _mem_set(ck, json.dumps(matches))
     return matches
 
 def get_team_form_from_matches(matches, team_name):
@@ -544,9 +576,12 @@ def get_team_form_from_matches(matches, team_name):
 def get_injuries(team_api_id, league_api_id):
     if not team_api_id or not league_api_id: return []
     ck = f"inj_{team_api_id}_{league_api_id}"
+    mem = _mem_get(ck, 12)
+    if mem: return json.loads(mem)
     # Extended to 12h (was 4h) -- injuries don't change hourly, saves quota
     cached = database.cache_get("injury_cache", ck, max_age_hours=12)
     if cached:
+        _mem_set(ck, cached)
         try: return json.loads(cached)
         except: pass
     data = _get("/injuries",
@@ -556,13 +591,17 @@ def get_injuries(team_api_id, league_api_id):
                  "type":   i.get("injury",{}).get("type","Injured"),
                  "reason": i.get("injury",{}).get("reason","")} for i in data[:8]]
     database.cache_set("injury_cache", ck, json.dumps(injuries))
+    _mem_set(ck, json.dumps(injuries))
     return injuries
 
 def get_team_stats(team_api_id, league_api_id):
     if not team_api_id or not league_api_id: return None
     ck = f"stats_{team_api_id}_{league_api_id}"
+    mem = _mem_get(ck, 12)
+    if mem: return json.loads(mem)
     cached = database.cache_get("h2h_cache", ck, max_age_hours=12)
     if cached:
+        _mem_set(ck, cached)
         try: return json.loads(cached)
         except: pass
     data = _get("/teams/statistics",
@@ -590,12 +629,16 @@ def get_team_stats(team_api_id, league_api_id):
         "splits":           parse_home_away_splits(s),
     }
     database.cache_set("h2h_cache", ck, json.dumps(stats))
+    _mem_set(ck, json.dumps(stats))
     return stats
 
 def get_standings(league_api_id):
     ck = f"standings_{league_api_id}"
+    mem = _mem_get(ck, 6)
+    if mem: return json.loads(mem)
     cached = database.cache_get("h2h_cache", ck, max_age_hours=6)
     if cached:
+        _mem_set(ck, cached)
         try: return json.loads(cached)
         except: pass
     data = _get("/standings", {"league": league_api_id, "season": CURRENT_SEASON})
@@ -615,6 +658,7 @@ def get_standings(league_api_id):
     except Exception as e:
         print(f"[standings] {e}")
     database.cache_set("h2h_cache", ck, json.dumps(table))
+    _mem_set(ck, json.dumps(table))
     return table
 
 # ===============================================================
