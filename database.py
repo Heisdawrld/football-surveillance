@@ -60,13 +60,44 @@ def init_db():
             team_name      TEXT NOT NULL,
             opponent       TEXT NOT NULL,
             league         TEXT,
-            market         TEXT NOT NULL,
-            predicted_prob REAL,
-            actual_win     INTEGER,
+            venue          TEXT NOT NULL,
+            result         TEXT NOT NULL,
+            goals_scored   INTEGER DEFAULT 0,
+            goals_conceded INTEGER DEFAULT 0,
+            gg_hit         INTEGER DEFAULT 0,
+            over25_hit     INTEGER DEFAULT 0,
+            over15_hit     INTEGER DEFAULT 0,
+            match_date     TEXT,
             logged_at      TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_tm_team   ON team_memory(team_name);
-        CREATE INDEX IF NOT EXISTS idx_tm_market ON team_memory(market);
+        CREATE INDEX IF NOT EXISTS idx_tm_team    ON team_memory(team_name);
+        CREATE INDEX IF NOT EXISTS idx_tm_venue   ON team_memory(team_name, venue);
+        CREATE INDEX IF NOT EXISTS idx_tm_h2h     ON team_memory(team_name, opponent);
+
+        CREATE TABLE IF NOT EXISTS team_profile (
+            team_name         TEXT PRIMARY KEY,
+            league            TEXT,
+            home_played       INTEGER DEFAULT 0,
+            home_wins         INTEGER DEFAULT 0,
+            home_draws        INTEGER DEFAULT 0,
+            home_losses       INTEGER DEFAULT 0,
+            home_goals_for    REAL DEFAULT 0,
+            home_goals_ag     REAL DEFAULT 0,
+            home_gg           INTEGER DEFAULT 0,
+            home_over25       INTEGER DEFAULT 0,
+            home_clean_sheets INTEGER DEFAULT 0,
+            away_played       INTEGER DEFAULT 0,
+            away_wins         INTEGER DEFAULT 0,
+            away_draws        INTEGER DEFAULT 0,
+            away_losses       INTEGER DEFAULT 0,
+            away_goals_for    REAL DEFAULT 0,
+            away_goals_ag     REAL DEFAULT 0,
+            away_gg           INTEGER DEFAULT 0,
+            away_over25       INTEGER DEFAULT 0,
+            away_clean_sheets INTEGER DEFAULT 0,
+            last_updated      TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_tp_team ON team_profile(team_name);
 
         CREATE TABLE IF NOT EXISTS market_calibration (
             market             TEXT PRIMARY KEY,
@@ -264,41 +295,114 @@ def get_recent_pending(limit=50):
     return [dict(r) for r in rows]
 
 
-def update_team_memory(home_team, away_team, league, market, prob, win):
-    """Store result in team memory for calibration."""
+def update_team_memory(home_team, away_team, league,
+                       home_score, away_score, match_date=None):
+    """
+    After a match settles, record actual performance for both teams.
+
+    Arsenal 3-1 Wolves:
+      Arsenal  -> home, WIN,  scored=3, conceded=1, gg=1, over25=1
+      Wolves   -> away, LOSS, scored=1, conceded=3, gg=1, over25=1
+
+    This builds real per-team intelligence from our own settled data.
+    Completely independent of any external API.
+    """
     try:
+        h = int(home_score); a = int(away_score)
+        total   = h + a
+        gg      = 1 if h > 0 and a > 0 else 0
+        over25  = 1 if total > 2 else 0
+        over15  = 1 if total > 1 else 0
+        h_res   = "W" if h > a else "D" if h == a else "L"
+        a_res   = "W" if a > h else "D" if h == a else "L"
+        now     = datetime.now(timezone.utc).isoformat()
+        mdate   = match_date or now[:10]
+
         with get_conn() as conn:
+            # Store individual match records
             conn.execute("""
                 INSERT INTO team_memory
-                (team_name, opponent, league, market, predicted_prob, actual_win, logged_at)
-                VALUES (?,?,?,?,?,?,?)
-            """, (home_team, away_team, league, market, prob, win,
-                  datetime.now(timezone.utc).isoformat()))
-            # Update market calibration
-            row = conn.execute(
-                "SELECT total, wins, avg_prob FROM market_calibration WHERE market=?",
-                (market,)).fetchone()
-            if row:
-                new_total = row["total"] + 1
-                new_wins  = row["wins"] + win
-                new_avg   = (row["avg_prob"] * row["total"] + prob) / new_total
-                new_hr    = round(new_wins / new_total * 100, 2)
-                new_cf    = round(new_hr / max(new_avg, 1), 3)
-                conn.execute("""
-                    UPDATE market_calibration
-                    SET total=?, wins=?, avg_prob=?, hit_rate=?,
-                        calibration_factor=?, last_updated=?
-                    WHERE market=?
-                """, (new_total, new_wins, new_avg, new_hr, new_cf,
-                      datetime.now(timezone.utc).isoformat(), market))
-            else:
-                hr = 100.0 if win else 0.0
-                conn.execute("""
-                    INSERT INTO market_calibration
-                    (market, total, wins, avg_prob, hit_rate, calibration_factor, last_updated)
-                    VALUES (?,1,?,?,?,1.0,?)
-                """, (market, win, prob, hr,
-                      datetime.now(timezone.utc).isoformat()))
+                (team_name, opponent, league, venue, result,
+                 goals_scored, goals_conceded, gg_hit, over25_hit, over15_hit,
+                 match_date, logged_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (home_team, away_team, league, "home", h_res,
+                  h, a, gg, over25, over15, mdate, now))
+
+            conn.execute("""
+                INSERT INTO team_memory
+                (team_name, opponent, league, venue, result,
+                 goals_scored, goals_conceded, gg_hit, over25_hit, over15_hit,
+                 match_date, logged_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (away_team, home_team, league, "away", a_res,
+                  a, h, gg, over25, over15, mdate, now))
+
+            # Update team profiles
+            for team, venue, gf, ga, res in [
+                (home_team, "home", h, a, h_res),
+                (away_team, "away", a, h, a_res),
+            ]:
+                existing = conn.execute(
+                    "SELECT * FROM team_profile WHERE team_name=?",
+                    (team,)).fetchone()
+
+                cs = 1 if ga == 0 else 0
+                w  = 1 if res == "W" else 0
+                d  = 1 if res == "D" else 0
+                l  = 1 if res == "L" else 0
+
+                if existing:
+                    if venue == "home":
+                        hp  = existing["home_played"] + 1
+                        hgf = existing["home_goals_for"] + gf
+                        hga = existing["home_goals_ag"] + ga
+                        conn.execute("""
+                            UPDATE team_profile SET
+                            home_played=?, home_wins=home_wins+?,
+                            home_draws=home_draws+?, home_losses=home_losses+?,
+                            home_goals_for=?, home_goals_ag=?,
+                            home_gg=home_gg+?, home_over25=home_over25+?,
+                            home_clean_sheets=home_clean_sheets+?,
+                            last_updated=? WHERE team_name=?
+                        """, (hp, w, d, l, hgf, hga, gg, over25, cs, now, team))
+                    else:
+                        ap  = existing["away_played"] + 1
+                        agf = existing["away_goals_for"] + gf
+                        aga = existing["away_goals_ag"] + ga
+                        conn.execute("""
+                            UPDATE team_profile SET
+                            away_played=?, away_wins=away_wins+?,
+                            away_draws=away_draws+?, away_losses=away_losses+?,
+                            away_goals_for=?, away_goals_ag=?,
+                            away_gg=away_gg+?, away_over25=away_over25+?,
+                            away_clean_sheets=away_clean_sheets+?,
+                            last_updated=? WHERE team_name=?
+                        """, (ap, w, d, l, agf, aga, gg, over25, cs, now, team))
+                else:
+                    if venue == "home":
+                        conn.execute("""
+                            INSERT INTO team_profile
+                            (team_name, league, home_played,
+                             home_wins, home_draws, home_losses,
+                             home_goals_for, home_goals_ag,
+                             home_gg, home_over25, home_clean_sheets,
+                             away_played, last_updated)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?)
+                        """, (team, league, 1, w, d, l, gf, ga,
+                              gg, over25, cs, now))
+                    else:
+                        conn.execute("""
+                            INSERT INTO team_profile
+                            (team_name, league, away_played,
+                             away_wins, away_draws, away_losses,
+                             away_goals_for, away_goals_ag,
+                             away_gg, away_over25, away_clean_sheets,
+                             home_played, last_updated)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?)
+                        """, (team, league, 1, w, d, l, gf, ga,
+                              gg, over25, cs, now))
+
     except Exception as e:
         print(f"[DB] update_team_memory: {e}")
 
@@ -318,33 +422,140 @@ def get_market_calibration():
     except:
         return {}
 
-def get_team_stats_memory(team_name, market=None, min_samples=5):
-    """Get historical accuracy for a specific team from memory."""
+def get_team_profile(team_name, venue="home", min_matches=5):
+    """
+    Get a team's real performance profile from our own settled data.
+
+    Returns per-venue stats:
+      win_rate, avg_goals_scored, avg_goals_conceded,
+      gg_rate, over25_rate, clean_sheet_rate
+
+    Used by match_predictor to adjust xG and conviction
+    based on what this team ACTUALLY does, not just what
+    the API says.
+
+    Returns None if less than min_matches recorded.
+    """
     try:
         with get_conn() as conn:
-            if market:
-                row = conn.execute("""
-                    SELECT COUNT(*) as total, SUM(actual_win) as wins,
-                           AVG(predicted_prob) as avg_prob
-                    FROM team_memory WHERE team_name=? AND market=?
-                """, (team_name, market)).fetchone()
-            else:
-                row = conn.execute("""
-                    SELECT COUNT(*) as total, SUM(actual_win) as wins,
-                           AVG(predicted_prob) as avg_prob
-                    FROM team_memory WHERE team_name=?
-                """, (team_name,)).fetchone()
-            if row and row["total"] and row["total"] >= min_samples:
-                total = row["total"]; wins = row["wins"] or 0
-                return {
-                    "total":    total,
-                    "wins":     wins,
-                    "hit_rate": round(wins/total*100, 1),
-                    "avg_prob": round(row["avg_prob"] or 50, 1),
-                }
+            row = conn.execute(
+                "SELECT * FROM team_profile WHERE team_name=?",
+                (team_name,)).fetchone()
+        if not row:
+            return None
+
+        if venue == "home":
+            played = row["home_played"] or 0
+            if played < min_matches:
+                return None
+            wins   = row["home_wins"]   or 0
+            draws  = row["home_draws"]  or 0
+            losses = row["home_losses"] or 0
+            gf     = row["home_goals_for"] or 0
+            ga     = row["home_goals_ag"]  or 0
+            gg     = row["home_gg"]        or 0
+            o25    = row["home_over25"]    or 0
+            cs     = row["home_clean_sheets"] or 0
+        else:
+            played = row["away_played"] or 0
+            if played < min_matches:
+                return None
+            wins   = row["away_wins"]   or 0
+            draws  = row["away_draws"]  or 0
+            losses = row["away_losses"] or 0
+            gf     = row["away_goals_for"] or 0
+            ga     = row["away_goals_ag"]  or 0
+            gg     = row["away_gg"]        or 0
+            o25    = row["away_over25"]    or 0
+            cs     = row["away_clean_sheets"] or 0
+
+        return {
+            "team":            team_name,
+            "venue":           venue,
+            "played":          played,
+            "wins":            wins,
+            "draws":           draws,
+            "losses":          losses,
+            "win_rate":        round(wins  / played * 100, 1),
+            "draw_rate":       round(draws / played * 100, 1),
+            "loss_rate":       round(losses/ played * 100, 1),
+            "avg_scored":      round(gf / played, 2),
+            "avg_conceded":    round(ga / played, 2),
+            "gg_rate":         round(gg  / played * 100, 1),
+            "over25_rate":     round(o25 / played * 100, 1),
+            "clean_sheet_rate":round(cs  / played * 100, 1),
+        }
     except Exception as e:
-        print(f"[DB] get_team_stats_memory: {e}")
+        print(f"[DB] get_team_profile: {e}")
     return None
+
+def get_h2h_memory(team_a, team_b, min_matches=3):
+    """
+    Our own head-to-head record from settled data.
+    Independent of API Football -- built entirely from our tracker.
+    """
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT result, goals_scored, goals_conceded, gg_hit, over25_hit
+                FROM team_memory
+                WHERE team_name=? AND opponent=?
+                ORDER BY match_date DESC LIMIT 10
+            """, (team_a, team_b)).fetchall()
+        if not rows or len(rows) < min_matches:
+            return None
+        total = len(rows)
+        wins  = sum(1 for r in rows if r["result"]=="W")
+        draws = sum(1 for r in rows if r["result"]=="D")
+        losses= sum(1 for r in rows if r["result"]=="L")
+        avg_gf = round(sum(r["goals_scored"]   for r in rows)/total, 2)
+        avg_ga = round(sum(r["goals_conceded"]  for r in rows)/total, 2)
+        gg_r   = round(sum(r["gg_hit"]          for r in rows)/total*100, 1)
+        o25_r  = round(sum(r["over25_hit"]      for r in rows)/total*100, 1)
+        return {
+            "total": total, "wins": wins, "draws": draws, "losses": losses,
+            "win_rate":  round(wins/total*100,1),
+            "avg_scored": avg_gf, "avg_conceded": avg_ga,
+            "gg_rate": gg_r, "over25_rate": o25_r,
+        }
+    except Exception as e:
+        print(f"[DB] get_h2h_memory: {e}")
+    return None
+
+def get_team_stats_memory(team_name, market=None, min_samples=5):
+    """Legacy wrapper -- use get_team_profile() for new code."""
+    return get_team_profile(team_name, min_matches=min_samples)
+
+def update_market_calibration(market, prob, win):
+    """Update global market hit rate -- separate from team memory."""
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT total, wins, avg_prob FROM market_calibration WHERE market=?",
+                (market,)).fetchone()
+            now = datetime.now(timezone.utc).isoformat()
+            if row:
+                new_total = row["total"] + 1
+                new_wins  = row["wins"] + win
+                new_avg   = (row["avg_prob"] * row["total"] + prob) / new_total
+                new_hr    = round(new_wins / new_total * 100, 2)
+                new_cf    = round(new_hr / max(new_avg, 1), 3)
+                conn.execute("""
+                    UPDATE market_calibration
+                    SET total=?, wins=?, avg_prob=?, hit_rate=?,
+                        calibration_factor=?, last_updated=?
+                    WHERE market=?
+                """, (new_total, new_wins, new_avg, new_hr, new_cf, now, market))
+            else:
+                hr = 100.0 if win else 0.0
+                conn.execute("""
+                    INSERT INTO market_calibration
+                    (market, total, wins, avg_prob, hit_rate,
+                     calibration_factor, last_updated)
+                    VALUES (?,1,?,?,?,1.0,?)
+                """, (market, win, prob, hr, now))
+    except Exception as e:
+        print(f"[DB] update_market_calibration: {e}")
 
 def cache_set(table, key, json_str):
     with get_conn() as conn:
