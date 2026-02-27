@@ -1,24 +1,24 @@
 “””
-external_data.py — API Football Integration v2
+external_data.py – API Football Integration v2
 Three new intelligence layers over v1:
 
-LAYER 1 — Squad Strength Index
+LAYER 1 – Squad Strength Index
 /players endpoint, 1 call per team, cached 24h
-Weighted rating by position → 0-100 strength score
+Weighted rating by position -> 0-100 strength score
 Injury penalty: -8% xG per key player missing
 
-LAYER 2 — Rolling xG (last 5 matches)
-Zero extra API calls — computed from existing fixture data
+LAYER 2 – Rolling xG (last 5 matches)
+Zero extra API calls – computed from existing fixture data
 Dynamic goals-scored/conceded proxy replaces static season averages
 
-LAYER 3 — Home/Away Splits
-Zero extra API calls — deeper parse of /teams/statistics response
+LAYER 3 – Home/Away Splits
+Zero extra API calls – deeper parse of /teams/statistics response
 Venue-specific win rates feed directly into conviction engine
 
 Free-tier quota architecture (100 calls/day):
-~30 calls  — morning batch (1 per unique team today, 24h cached)
-~40 calls  — on-demand H2H + last5 + injuries during the day
-~30 buffer — reserved / cache misses
+~30 calls  – morning batch (1 per unique team today, 24h cached)
+~40 calls  – on-demand H2H + last5 + injuries during the day
+~30 buffer – reserved / cache misses
 “””
 
 import os, json, requests, time
@@ -29,16 +29,16 @@ APIFOOTBALL_KEY  = os.environ.get(“APIFOOTBALL_KEY”, “d1d7aaea599eb42ce6a7
 APIFOOTBALL_BASE = “https://v3.football.api-sports.io”
 CURRENT_SEASON   = 2025
 
-# ── football-data.org — FREE unlimited for top 10 leagues ──────────────────
+# – football-data.org – FREE unlimited for top 10 leagues ——————
 
-# Used for: standings, H2H, recent results — saves API Football quota
+# Used for: standings, H2H, recent results – saves API Football quota
 
 # for player stats (the expensive layer)
 
 FDORG_KEY  = os.environ.get(“FDORG_KEY”, “9f4755094ff9435695b794f91f4c1474”)
 FDORG_BASE = “https://api.football-data.org/v4”
 
-# Bzzoiro league ID → football-data.org competition code
+# Bzzoiro league ID -> football-data.org competition code
 
 FDORG_LEAGUE_MAP = {
 1:  “PL”,   # Premier League
@@ -55,7 +55,7 @@ FDORG_LEAGUE_MAP = {
 }
 
 def _fdorg_get(endpoint, params=None):
-“”“football-data.org API caller — free, no quota tracking needed.”””
+“”“football-data.org API caller – free, no quota tracking needed.”””
 if not FDORG_KEY:
 return None
 try:
@@ -65,7 +65,7 @@ headers={“X-Auth-Token”: FDORG_KEY},
 params=params or {}, timeout=10
 )
 if r.status_code == 429:
-print(”[FDOrg] rate limited — backing off”)
+print(”[FDOrg] rate limited – backing off”)
 return None
 if r.status_code != 200:
 print(f”[FDOrg] {endpoint}: HTTP {r.status_code}”)
@@ -180,7 +180,7 @@ POSITION_WEIGHTS = {
 
 _quota = {“date”: “”, “count”: 0}
 
-# ── Core API caller ───────────────────────────────────────────────────────────
+# – Core API caller ———————————————————–
 
 def _get(endpoint, params):
 if not APIFOOTBALL_KEY:
@@ -214,11 +214,11 @@ except Exception as e:
 def get_quota_status():
 return {“used”: _quota[“count”], “remaining”: max(0, 100 - _quota[“count”])}
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
-# LAYER 1 — SQUAD STRENGTH INDEX
+# LAYER 1 – SQUAD STRENGTH INDEX
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
 def get_squad_stats(team_api_id, league_api_id):
 “””
@@ -335,20 +335,20 @@ def _default_squad():
 return {“score”:50.0, “attack”:50.0, “defense”:50.0,
 “key_missing”:0, “penalty”:1.0, “top_players”:[], “player_count”:0}
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
-# LAYER 2 — ROLLING xG (zero extra API calls)
+# LAYER 2 – ROLLING xG (zero extra API calls)
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
 def compute_rolling_xg(last_matches, team_name):
 “””
 Compute rolling xG proxy from last 5 match goals.
-Zero additional API calls — uses already-fetched fixture data.
+Zero additional API calls – uses already-fetched fixture data.
 
 ```
 Returns rolling_for, rolling_against, trend, momentum_factor.
-momentum_factor: 0.88 (falling) → 1.0 (stable) → 1.12 (rising)
+momentum_factor: 0.88 (falling) -> 1.0 (stable) -> 1.12 (rising)
 """
 if not last_matches:
     return {"rolling_for":1.2, "rolling_against":1.0,
@@ -384,16 +384,16 @@ return {"rolling_for": avg_for, "rolling_against": avg_against,
         "trend": trend, "momentum_factor": round(mf, 3)}
 ```
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
-# LAYER 3 — HOME/AWAY SPLITS (zero extra API calls)
+# LAYER 3 – HOME/AWAY SPLITS (zero extra API calls)
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
 def parse_home_away_splits(raw_stats):
 “””
 Extract venue-split stats from /teams/statistics raw response.
-Called inside get_team_stats — no extra API call.
+Called inside get_team_stats – no extra API call.
 “””
 if not raw_stats:
 return None
@@ -437,11 +437,11 @@ return {
 }
 ```
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
-# BATCH JOB — 6am WAT daily pre-fetch
+# BATCH JOB – 6am WAT daily pre-fetch
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
 def run_daily_batch(today_matches):
 “””
@@ -471,17 +471,17 @@ for m in today_matches:
         made += 1
         time.sleep(0.25)
 
-print(f"[batch] done — {made} fetched, {skipped} cached | quota: {get_quota_status()}")
+print(f"[batch] done -- {made} fetched, {skipped} cached | quota: {get_quota_status()}")
 return {"calls_made": made, "calls_skipped": skipped}
 ```
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
-# EXISTING FUNCTIONS — H2H, last matches, injuries, stats, standings
+# EXISTING FUNCTIONS – H2H, last matches, injuries, stats, standings
 
-# Injury cache extended: 4h → 12h to protect quota
+# Injury cache extended: 4h -> 12h to protect quota
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
 def get_h2h(home_api_id, away_api_id, last=8):
 if not home_api_id or not away_api_id: return []
@@ -575,7 +575,7 @@ return form
 def get_injuries(team_api_id, league_api_id):
 if not team_api_id or not league_api_id: return []
 ck = f”inj_{team_api_id}_{league_api_id}”
-# Extended to 12h (was 4h) — injuries don’t change hourly, saves quota
+# Extended to 12h (was 4h) – injuries don’t change hourly, saves quota
 cached = database.cache_get(“injury_cache”, ck, max_age_hours=12)
 if cached:
 try: return json.loads(cached)
@@ -648,11 +648,11 @@ print(f”[standings] {e}”)
 database.cache_set(“h2h_cache”, ck, json.dumps(table))
 return table
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
 # ENRICH MATCH
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
 def enrich_match(api_data):
 enriched = {
@@ -687,7 +687,7 @@ a_name      = event.get(“away_team”,””)
         enriched["away_last"]    = get_last_matches(a_ext)
         enriched["home_form"]    = get_team_form_from_matches(enriched["home_last"], h_name)
         enriched["away_form"]    = get_team_form_from_matches(enriched["away_last"], a_name)
-        # Layer 2: rolling xG — zero extra calls
+        # Layer 2: rolling xG -- zero extra calls
         enriched["home_rolling_xg"] = compute_rolling_xg(enriched["home_last"], h_name)
         enriched["away_rolling_xg"] = compute_rolling_xg(enriched["away_last"], a_name)
 
@@ -700,7 +700,7 @@ a_name      = event.get(“away_team”,””)
         # Fall back to API Football only if FDOrg doesn't cover this league
         fdorg_standings = get_standings_fdorg(our_l_id)
         enriched["standings"] = fdorg_standings if fdorg_standings else get_standings(ext_l_id)
-        # Layer 1: squad strength — batch pre-fetched, cache hit here
+        # Layer 1: squad strength -- batch pre-fetched, cache hit here
         if h_ext:
             enriched["home_squad"] = compute_squad_strength(
                 get_squad_stats(h_ext, ext_l_id), enriched["home_injuries"])
@@ -716,11 +716,11 @@ except Exception as e:
 return enriched
 ```
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
 # ANALYST NARRATIVE
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
 def build_analyst_narrative(enriched, h_name, a_name):
 h = h_name.split()[0]; a = a_name.split()[0]
@@ -744,12 +744,12 @@ if h_form or a_form:
     a_pts = sum(3 if r=="W" else 1 if r=="D" else 0 for r in a_form)
     hp = round(h_pts/max(len(h_form)*3,1)*100)
     ap = round(a_pts/max(len(a_form)*3,1)*100)
-    hs = " ".join(h_form) or "—"; as_ = " ".join(a_form) or "—"
-    if hp > ap+20:   out["form"] = f"{h} in strong form ({hs}) · {a} struggling ({as_})"
-    elif ap > hp+20: out["form"] = f"{a} in-form ({as_}) · {h} poor run ({hs})"
-    else:            out["form"] = f"Evenly matched recent form · {h}: {hs} · {a}: {as_}"
-    if hp>=80:   out["morale"] = f"{h} full of confidence — {h_form.count('W')} wins in last {len(h_form)}"
-    elif ap>=80: out["morale"] = f"{a} on a hot streak — {a_form.count('W')} wins in last {len(a_form)}"
+    hs = " ".join(h_form) or "--"; as_ = " ".join(a_form) or "--"
+    if hp > ap+20:   out["form"] = f"{h} in strong form ({hs}) * {a} struggling ({as_})"
+    elif ap > hp+20: out["form"] = f"{a} in-form ({as_}) * {h} poor run ({hs})"
+    else:            out["form"] = f"Evenly matched recent form * {h}: {hs} * {a}: {as_}"
+    if hp>=80:   out["morale"] = f"{h} full of confidence -- {h_form.count('W')} wins in last {len(h_form)}"
+    elif ap>=80: out["morale"] = f"{a} on a hot streak -- {a_form.count('W')} wins in last {len(a_form)}"
     else:        out["morale"] = None
 
 # H2H
@@ -757,28 +757,28 @@ if h2h and h2h["total"]>=3:
     hw=h2h["home_wins"]; dr=h2h["draws"]; aw=h2h["away_wins"]; n=h2h["total"]
     if hw/n>=0.6:   dom=f"{h} dominant in this fixture ({hw}W-{dr}D-{aw}L)"
     elif aw/n>=0.6: dom=f"{a} historically strong here ({aw}W-{dr}D-{hw}L)"
-    elif dr/n>=0.5: dom=f"This fixture draws frequently — {dr} of {n} meetings ended level"
-    else:           dom=f"Tight H2H — {hw}W {dr}D {aw}L over {n} meetings"
-    out["h2h"] = f"{dom} · Avg {h2h['avg_goals']} goals"
+    elif dr/n>=0.5: dom=f"This fixture draws frequently -- {dr} of {n} meetings ended level"
+    else:           dom=f"Tight H2H -- {hw}W {dr}D {aw}L over {n} meetings"
+    out["h2h"] = f"{dom} * Avg {h2h['avg_goals']} goals"
 
-# Goals — rolling xG preferred over season averages
+# Goals -- rolling xG preferred over season averages
 if h_rxg and a_rxg:
     hf=h_rxg["rolling_for"]; hag=h_rxg["rolling_against"]
     af=a_rxg["rolling_for"]; aag=a_rxg["rolling_against"]
     exp = round((hf+aag+af+hag)/2,1)
     note=""
-    if h_rxg["trend"]=="RISING": note=f" · {h} scoring more in recent games"
-    elif a_rxg["trend"]=="RISING": note=f" · {a} on an attacking upswing"
-    if exp>=3.0:   out["goals"]=f"High-scoring game likely — {h} {hf:.1f}/g, {a} {af:.1f}/g (last 5){note}"
-    elif exp>=2.2: out["goals"]=f"Goals expected — {h} scores {hf:.1f}/g, {a} scores {af:.1f}/g (last 5){note}"
-    else:          out["goals"]=f"Tight match — {h} concedes {hag:.1f}/g, {a} concedes {aag:.1f}/g (last 5)"
+    if h_rxg["trend"]=="RISING": note=f" * {h} scoring more in recent games"
+    elif a_rxg["trend"]=="RISING": note=f" * {a} on an attacking upswing"
+    if exp>=3.0:   out["goals"]=f"High-scoring game likely -- {h} {hf:.1f}/g, {a} {af:.1f}/g (last 5){note}"
+    elif exp>=2.2: out["goals"]=f"Goals expected -- {h} scores {hf:.1f}/g, {a} scores {af:.1f}/g (last 5){note}"
+    else:          out["goals"]=f"Tight match -- {h} concedes {hag:.1f}/g, {a} concedes {aag:.1f}/g (last 5)"
 elif h_st and a_st:
     hs_a=h_st.get("avg_scored",0); hc_a=h_st.get("avg_conceded",0)
     as_a=a_st.get("avg_scored",0); ac_a=a_st.get("avg_conceded",0)
     exp=round((hs_a+ac_a+as_a+hc_a)/2,1)
-    if exp>=3.0:   out["goals"]=f"Both sides open defensively — {h} {hs_a}/g, {a} {as_a}/g"
-    elif exp>=2.2: out["goals"]=f"Goals expected — {h} scores {hs_a}, concedes {hc_a} · {a} scores {as_a}, concedes {ac_a}"
-    else:          out["goals"]=f"Tight match likely — {h} concedes {hc_a}/g, {a} concedes {ac_a}/g"
+    if exp>=3.0:   out["goals"]=f"Both sides open defensively -- {h} {hs_a}/g, {a} {as_a}/g"
+    elif exp>=2.2: out["goals"]=f"Goals expected -- {h} scores {hs_a}, concedes {hc_a} * {a} scores {as_a}, concedes {ac_a}"
+    else:          out["goals"]=f"Tight match likely -- {h} concedes {hc_a}/g, {a} concedes {ac_a}/g"
 
 # Squad intelligence
 if h_sq and a_sq and h_sq["player_count"]>0:
@@ -788,9 +788,9 @@ if h_sq and a_sq and h_sq["player_count"]>0:
         out["squad"] = (f"{s} hold a clear squad quality edge "
                        f"({max(hs,as_s):.0f}/100 vs {min(hs,as_s):.0f}/100)")
     else:
-        out["squad"] = f"Evenly matched squads — {h} {hs:.0f}/100 vs {a} {as_s:.0f}/100"
-    if h_sq["key_missing"]>0: out["squad"]+=f" · {h} missing {h_sq['key_missing']} key player(s)"
-    if a_sq["key_missing"]>0: out["squad"]+=f" · {a} missing {a_sq['key_missing']} key player(s)"
+        out["squad"] = f"Evenly matched squads -- {h} {hs:.0f}/100 vs {a} {as_s:.0f}/100"
+    if h_sq["key_missing"]>0: out["squad"]+=f" * {h} missing {h_sq['key_missing']} key player(s)"
+    if a_sq["key_missing"]>0: out["squad"]+=f" * {a} missing {a_sq['key_missing']} key player(s)"
     if h_sq["top_players"]:
         tp=h_sq["top_players"][0]
         out["top_player"]=f"{h} key man: {tp['name']} ({tp['rating']:.1f} rating, {tp['goals']}G {tp['assists']}A)"
@@ -802,7 +802,7 @@ if h_sq and a_sq and h_sq["player_count"]>0:
 miss=[]
 if h_inj: miss.append(f"{h}: {', '.join(i['name'] for i in h_inj[:2])}")
 if a_inj: miss.append(f"{a}: {', '.join(i['name'] for i in a_inj[:2])}")
-if miss: out["injuries"]=" · ".join(miss)+" sidelined"
+if miss: out["injuries"]=" * ".join(miss)+" sidelined"
 
 return out
 ```
