@@ -1318,8 +1318,19 @@ def match_display(match_id):
 
 @app.route("/acca")
 def acca():
-    all_matches  = fetch_all_predictions()
-    picks, combined = match_predictor.pick_acca(all_matches, n=5, min_conv=42.0)
+    all_matches = fetch_all_predictions()
+    # ACCA only uses TODAY + TOMORROW fixtures — never future dates or stale matches
+    today_wat    = now_wat().date()
+    tomorrow_wat = today_wat + timedelta(days=1)
+    acca_matches = []
+    for m in all_matches:
+        e   = m.get("event", {})
+        raw = e.get("event_timestamp") or e.get("event_date", "")
+        dt  = parse_dt(raw)
+        d   = dt.date()
+        if d == today_wat or d == tomorrow_wat:
+            acca_matches.append(m)
+    picks, combined = match_predictor.pick_acca(acca_matches, n=5, min_conv=42.0)
 
     c = '<div style="padding:22px 0 14px" class="up"><p class="eyebrow">Daily Best Picks</p><h1 class="title" style="margin-top:5px">ACCA</h1></div>'
     if not picks:
@@ -1379,6 +1390,22 @@ def tracker():
     roi_c  = "var(--g)" if roi>=0 else "var(--r)"
 
     c = '<div style="padding:22px 0 14px" class="up"><p class="eyebrow">Model Performance</p><h1 class="title" style="margin-top:5px">TRACKER</h1></div>'
+
+    # ── Empty state — shown when no real predictions logged yet ──
+    if total == 0:
+        c += '''<div style="background:var(--s);border:1px solid var(--bdr);border-radius:18px;padding:28px 20px;text-align:center;margin-top:8px">
+          <div style="font-size:2rem;margin-bottom:12px">📊</div>
+          <p style="font-size:.85rem;font-weight:800;color:var(--wh);margin-bottom:8px">No Results Yet</p>
+          <p style="font-size:.7rem;color:var(--t);line-height:1.8;max-width:280px;margin:0 auto">
+            The Tracker only shows predictions this model has actually made.<br><br>
+            Browse any match page and the prediction gets logged automatically.
+            Once that match finishes, the result settles here with a WIN or LOSS.
+          </p>
+          <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--bdr)">
+            <a href="/" style="display:inline-flex;align-items:center;gap:6px;font-size:.65rem;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--g);padding:10px 20px;border:1px solid rgba(0,230,118,.25);border-radius:50px">Browse Leagues →</a>
+          </div>
+        </div>'''
+        return render_template_string(LAYOUT, content=c, page="tracker")
 
     # ── Hero stats ──
     c += f'''<div class="tracker-hero up d1">
