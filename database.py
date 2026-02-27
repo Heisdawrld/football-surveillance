@@ -1,5 +1,5 @@
 “””
-database.py — ProPredictor persistence layer v2
+database.py – ProPredictor persistence layer v2
 Full tracker support: seeded demo data, performance stats, reliability scores.
 “””
 import sqlite3, os, json
@@ -55,7 +55,7 @@ CREATE INDEX IF NOT EXISTS idx_pred_market ON predictions(market);
 CREATE INDEX IF NOT EXISTS idx_pred_result ON predictions(result);
 CREATE INDEX IF NOT EXISTS idx_pred_date   ON predictions(match_date);
 “””)
-# ── Safe migration: add new columns if they don’t exist ──
+# – Safe migration: add new columns if they don’t exist –
 # This handles both fresh DBs and existing deployed DBs on Render
 existing_cols = {r[1] for r in conn.execute(“PRAGMA table_info(predictions)”).fetchall()}
 migrations = [
@@ -212,7 +212,7 @@ roi = _calc_roi(roi_data)
 ```
 
 def _calc_streak(results):
-if not results: return {“type”:”—”,“count”:0}
+if not results: return {“type”:”–”,“count”:0}
 cur = results[0]; count = 1
 for r in results[1:]:
 if r == cur: count += 1
