@@ -1,710 +1,808 @@
-"""
-match_predictor.py — ProPredictor Conviction Engine v4
+“””
+external_data.py — API Football Integration v2
+Three new intelligence layers over v1:
 
-TIP STRUCTURE (as defined by user):
-  RECOMMENDED TIP  — 1X2, GG/NG, Overs/Unders, Team to Score
-  SAFEST TIP       — Over 1.5 Goals, Double Chance (1X/X2/12), Win Either Half
-  RISKY MARKET     — HT/FT, Combo (1X2+GG, 1X2+Overs, WIN+Overs)
+LAYER 1 — Squad Strength Index
+/players endpoint, 1 call per team, cached 24h
+Weighted rating by position → 0-100 strength score
+Injury penalty: -8% xG per key player missing
 
-Conviction engine scores each tip across:
-  - Normalised probability
-  - xG signal (independent creation data)
-  - Form signal (from API Football real data)
-  - Standing signal
-  - Value edge vs bookmaker
-"""
+LAYER 2 — Rolling xG (last 5 matches)
+Zero extra API calls — computed from existing fixture data
+Dynamic goals-scored/conceded proxy replaces static season averages
 
-import math
+LAYER 3 — Home/Away Splits
+Zero extra API calls — deeper parse of /teams/statistics response
+Venue-specific win rates feed directly into conviction engine
 
-# ── Poisson ───────────────────────────────────────────────────────────────────
+Free-tier quota architecture (100 calls/day):
+~30 calls  — morning batch (1 per unique team today, 24h cached)
+~40 calls  — on-demand H2H + last5 + injuries during the day
+~30 buffer — reserved / cache misses
+“””
 
-def poisson_pmf(k, lam):
-    if lam <= 0:
-        return 1.0 if k == 0 else 0.0
-    return (lam ** k) * math.exp(-lam) / math.factorial(k)
+import os, json, requests, time
+from datetime import datetime, timezone, timedelta
+import database
 
-# ── Form utilities ────────────────────────────────────────────────────────────
+APIFOOTBALL_KEY  = os.environ.get(“APIFOOTBALL_KEY”, “d1d7aaea599eb42ce6a723c2935ee70e”)
+APIFOOTBALL_BASE = “https://v3.football.api-sports.io”
+CURRENT_SEASON   = 2025
 
-FORM_WEIGHTS = [1.0, 1.2, 1.4, 1.6, 1.8]
-FORM_VALUE   = {"W": 1.0, "D": 0.4, "L": 0.0}
+# ── football-data.org — FREE unlimited for top 10 leagues ──────────────────
 
-def form_score(form_list):
-    if not form_list:
-        return 0.5
-    results = [r.upper() for r in list(form_list)[-5:]]
-    weights = FORM_WEIGHTS[-len(results):]
-    score   = sum(FORM_VALUE.get(r, 0.5) * w for r, w in zip(results, weights))
-    return round(score / sum(weights), 4)
+# Used for: standings, H2H, recent results — saves API Football quota
 
-def form_trend(form_list):
-    if not form_list or len(form_list) < 3:
-        return "STABLE"
-    results = [r.upper() for r in list(form_list)[-5:]]
-    vals    = [FORM_VALUE.get(r, 0.5) for r in results]
-    recent  = sum(vals[-2:]) / 2
-    earlier = sum(vals[:2]) / 2
-    diff    = recent - earlier
-    if diff >  0.25: return "RISING"
-    if diff < -0.25: return "FALLING"
-    return "STABLE"
+# for player stats (the expensive layer)
 
-def momentum_score(h_form, a_form, h_xg, a_xg):
-    h_f = form_score(h_form)
-    a_f = form_score(a_form)
-    total_xg   = max(h_xg + a_xg, 0.1)
-    h_xg_share = h_xg / total_xg
-    a_xg_share = a_xg / total_xg
-    h_mom = round((h_f * 0.6 + h_xg_share * 0.4) * 100, 1)
-    a_mom = round((a_f * 0.6 + a_xg_share * 0.4) * 100, 1)
-    h_trend = form_trend(h_form)
-    a_trend = form_trend(a_form)
-    gap = abs(h_mom - a_mom)
-    if gap < 8:
-        narrative = "Momentum evenly balanced — neither side holds a clear edge"
-    elif h_mom > a_mom:
-        narrative = f"Home side carrying the momentum ({h_trend.lower()} form)"
-    else:
-        narrative = f"Away side the in-form team ({a_trend.lower()} trajectory)"
-    return {
-        "home": h_mom, "away": a_mom,
-        "h_trend": h_trend, "a_trend": a_trend,
-        "narrative": narrative
-    }
+FDORG_KEY  = os.environ.get(“FDORG_KEY”, “9f4755094ff9435695b794f91f4c1474”)
+FDORG_BASE = “https://api.football-data.org/v4”
 
-def value_edge(market_prob, bookmaker_odds):
-    if not bookmaker_odds or bookmaker_odds <= 1.0:
+# Bzzoiro league ID → football-data.org competition code
+
+FDORG_LEAGUE_MAP = {
+1:  “PL”,   # Premier League
+3:  “PD”,   # La Liga
+4:  “SA”,   # Serie A
+5:  “BL1”,  # Bundesliga
+6:  “FL1”,  # Ligue 1
+7:  “CL”,   # Champions League
+8:  “EL”,   # Europa League
+9:  “DED”,  # Eredivisie
+12: “ELC”,  # Championship
+13: “PPL”,  # Primeira Liga
+2:  “PPL”,  # Liga Portugal
+}
+
+def _fdorg_get(endpoint, params=None):
+“”“football-data.org API caller — free, no quota tracking needed.”””
+if not FDORG_KEY:
+return None
+try:
+r = requests.get(
+f”{FDORG_BASE}{endpoint}”,
+headers={“X-Auth-Token”: FDORG_KEY},
+params=params or {}, timeout=10
+)
+if r.status_code == 429:
+print(”[FDOrg] rate limited — backing off”)
+return None
+if r.status_code != 200:
+print(f”[FDOrg] {endpoint}: HTTP {r.status_code}”)
+return None
+return r.json()
+except Exception as e:
+print(f”[FDOrg] {endpoint} failed: {e}”)
+return None
+
+def get_standings_fdorg(our_league_id):
+“””
+Get live standings via football-data.org (free, unlimited).
+Returns same format as get_standings() for drop-in use.
+“””
+code = FDORG_LEAGUE_MAP.get(our_league_id)
+if not code:
+return None
+ck = f”fdorg_standings_{our_league_id}”
+cached = database.cache_get(“h2h_cache”, ck, max_age_hours=6)
+if cached:
+try: return json.loads(cached)
+except: pass
+
+```
+data = _fdorg_get(f"/competitions/{code}/standings")
+if not data:
+    return None
+table = {}
+try:
+    for grp in data.get("standings", []):
+        if grp.get("type") != "TOTAL":
+            continue
+        for t in grp.get("table", []):
+            tid = str(t["team"]["id"])
+            table[tid] = {
+                "rank":    t.get("position", 0),
+                "name":    t["team"]["name"],
+                "points":  t.get("points", 0),
+                "played":  t.get("playedGames", 0),
+                "gd":      t.get("goalDifference", 0),
+                "form":    t.get("form", "") or "",
+                "wins":    t.get("won", 0),
+                "draws":   t.get("draw", 0),
+                "losses":  t.get("lost", 0),
+                "gf":      t.get("goalsFor", 0),
+                "ga":      t.get("goalsAgainst", 0),
+            }
+except Exception as e:
+    print(f"[FDOrg standings] {e}")
+    return None
+if table:
+    database.cache_set("h2h_cache", ck, json.dumps(table))
+return table if table else None
+```
+
+def get_team_last_matches_fdorg(team_fdorg_id, our_league_id, last=5):
+“””
+Get last N results for a team via football-data.org (free, unlimited).
+Returns same format as get_last_matches() for drop-in use.
+“””
+code = FDORG_LEAGUE_MAP.get(our_league_id)
+if not code or not team_fdorg_id:
+return []
+ck = f”fdorg_last_{team_fdorg_id}_{last}”
+cached = database.cache_get(“h2h_cache”, ck, max_age_hours=6)
+if cached:
+try: return json.loads(cached)
+except: pass
+
+```
+data = _fdorg_get(f"/teams/{team_fdorg_id}/matches",
+                  {"status": "FINISHED", "limit": last})
+if not data:
+    return []
+matches = []
+for m in data.get("matches", [])[-last:]:
+    home = m.get("homeTeam", {}).get("name", "?")
+    away = m.get("awayTeam", {}).get("name", "?")
+    sc   = m.get("score", {}).get("fullTime", {})
+    hg   = sc.get("home")
+    ag   = sc.get("away")
+    matches.append({
+        "date":       (m.get("utcDate","")[:10]),
+        "home":       home,
+        "away":       away,
+        "home_goals": hg,
+        "away_goals": ag,
+        "league":     code,
+    })
+matches.sort(key=lambda x: x["date"], reverse=True)
+if matches:
+    database.cache_set("h2h_cache", ck, json.dumps(matches))
+return matches
+```
+
+LEAGUE_ID_MAP = {
+1: 39, 2: 94, 3: 140, 4: 135, 5: 78, 6: 61,
+7: 2, 8: 3, 9: 88, 10: 235, 11: 203, 12: 40,
+13: 179, 14: 144, 15: 207, 16: 218, 17: 197,
+18: 253, 19: 71, 20: 262, 21: 128,
+32: 307, 33: 188, 34: 382, 44: 848,
+}
+
+POSITION_WEIGHTS = {
+“Attacker”:   0.40,
+“Midfielder”: 0.35,
+“Defender”:   0.20,
+“Goalkeeper”: 0.05,
+}
+
+# In-memory quota tracker
+
+_quota = {“date”: “”, “count”: 0}
+
+# ── Core API caller ───────────────────────────────────────────────────────────
+
+def _get(endpoint, params):
+if not APIFOOTBALL_KEY:
+return None
+today = datetime.now(timezone.utc).strftime(”%Y-%m-%d”)
+if _quota[“date”] != today:
+_quota[“date”] = today
+_quota[“count”] = 0
+_quota[“count”] += 1
+print(f”[APIFootball] #{_quota[‘count’]}/100 {endpoint} {list(params.items())[:2]}”)
+
+```
+try:
+    r = requests.get(
+        f"{APIFOOTBALL_BASE}{endpoint}",
+        headers={"x-rapidapi-key": APIFOOTBALL_KEY,
+                 "x-rapidapi-host": "v3.football.api-sports.io"},
+        params=params, timeout=12
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("errors"):
+        print(f"[APIFootball] error: {data['errors']}")
         return None
-    implied = 1 / bookmaker_odds
-    edge    = (market_prob / 100) - implied
-    return round(edge * 100, 1)
+    return data.get("response", [])
+except Exception as e:
+    print(f"[APIFootball] {endpoint} failed: {e}")
+    return None
+```
 
-def style_profile(h_xg, a_xg, btts):
-    total = h_xg + a_xg
-    if total >= 3.0:   s = "High-scoring encounter expected — both teams creating freely"
-    elif total >= 2.2: s = "Open game — goals likely from both ends"
-    elif total >= 1.5: s = "Balanced midfield contest — goals possible but not guaranteed"
-    else:              s = "Defensive game likely — set pieces and moments of quality will decide"
-    if btts >= 65:     s += " · Both teams likely to find the net"
-    elif btts <= 35:   s += " · Clean sheet on the cards"
-    return s
+def get_quota_status():
+return {“used”: _quota[“count”], “remaining”: max(0, 100 - _quota[“count”])}
 
-# ── xG / Form / Standing signals ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 
-def _xg_signal(tip, h_xg, a_xg):
-    total = max(h_xg + a_xg, 0.1)
-    h_dom = h_xg / total
-    a_dom = a_xg / total
-    if tip == "HOME WIN":
-        return min(h_dom / 0.6, 1.0) if h_dom > 0.5 else h_dom * 0.5
-    elif tip == "AWAY WIN":
-        return min(a_dom / 0.6, 1.0) if a_dom > 0.5 else a_dom * 0.5
-    elif tip == "DRAW":
-        return 1 - abs(h_dom - 0.5) * 2
-    elif tip == "GG":
-        return min(h_xg / 0.8, 1.0) * min(a_xg / 0.8, 1.0)
-    elif tip == "NG":
-        return max(0, 1 - min(h_xg / 0.8, 1.0) * min(a_xg / 0.8, 1.0))
-    elif tip in ("OVER 1.5", "OVER 2.5", "OVER 3.5"):
-        t = {"OVER 1.5": 1.8, "OVER 2.5": 2.4, "OVER 3.5": 3.2}[tip]
-        return min(total / t, 1.0)
-    elif tip == "UNDER 2.5":
-        return max(0, 1 - total / 2.4)
-    return 0.5
+# LAYER 1 — SQUAD STRENGTH INDEX
 
-def _form_signal(tip, h_form, a_form):
-    h_f = form_score(h_form)
-    a_f = form_score(a_form)
-    if tip == "HOME WIN":
-        return h_f * (1 - a_f * 0.5)
-    elif tip == "AWAY WIN":
-        return a_f * (1 - h_f * 0.5)
-    elif tip == "DRAW":
-        return (1 - abs(h_f - a_f)) * (1 - abs((h_f + a_f)/2 - 0.5) * 2)
-    elif tip in ("GG", "OVER 1.5", "OVER 2.5", "OVER 3.5"):
-        return (h_f + a_f) / 2
-    elif tip in ("NG", "UNDER 2.5"):
-        return 1 - (h_f + a_f) / 2
-    return 0.5
+# ═══════════════════════════════════════════════════════════════
 
-def _standing_signal(tip, h_stand, a_stand, total=20):
-    if not h_stand or not a_stand:
-        return 0.5
-    h_str = 1 - h_stand / total
-    a_str = 1 - a_stand / total
-    if tip == "HOME WIN":
-        return h_str * (1 - a_str * 0.5)
-    elif tip == "AWAY WIN":
-        return a_str * (1 - h_str * 0.5)
-    elif tip == "DRAW":
-        return 1 - abs(h_str - a_str)
-    elif tip in ("OVER 1.5", "OVER 2.5", "GG"):
-        return (h_str + a_str) / 2
-    return 0.5
+def get_squad_stats(team_api_id, league_api_id):
+“””
+Fetch player statistics for a team. 1 API call, cached 24 hours.
+Returns list of player dicts with rating, position, goals, assists, minutes.
+“””
+if not team_api_id or not league_api_id:
+return []
+ck = f”squad_{team_api_id}*{league_api_id}*{CURRENT_SEASON}”
+cached = database.cache_get(“h2h_cache”, ck, max_age_hours=24)
+if cached:
+try: return json.loads(cached)
+except: pass
 
-def _value_signal(prob, bookie_odds):
-    edge = value_edge(prob, bookie_odds)
-    if edge is None:
-        return 0.5
-    return max(0.0, min(1.0, 0.5 + edge / 20))
+```
+data = _get("/players", {
+    "team": team_api_id, "league": league_api_id, "season": CURRENT_SEASON
+})
+if not data:
+    return []
 
-def _agreement_count(tip, h_xg, a_xg, h_form, a_form, h_stand, a_stand):
-    signals = [
-        _xg_signal(tip, h_xg, a_xg),
-        min(_form_signal(tip, h_form, a_form), 1.0),
-        _standing_signal(tip, h_stand, a_stand),
-    ]
-    return sum(1 for s in signals if s >= 0.55)
-
-def conviction_score(tip, prob, bookie_odds, h_xg, a_xg, h_form, a_form, h_stand, a_stand):
-    """
-    Multi-signal conviction. Normalised probability per market category
-    so Over 1.5 at 88% doesn't automatically beat Home Win at 55%.
-    """
-    s_xg       = _xg_signal(tip, h_xg, a_xg)
-    s_form     = min(_form_signal(tip, h_form, a_form), 1.0)
-    s_standing = _standing_signal(tip, h_stand, a_stand)
-    s_value    = _value_signal(prob, bookie_odds)
-
-    # Normalised probability per market category.
-    # Goals markets have high baselines — Over 1.5 at 88% is routine.
-    # 1X2 tips at 55%+ are genuinely meaningful — don't let Over 1.5 drown them.
-    norm_map = {
-        "OVER 1.5":  (78, 97),   # very high baseline — only truly elite scores matter
-        "OVER 2.5":  (48, 85),
-        "OVER 3.5":  (22, 62),
-        "UNDER 2.5": (22, 65),
-        "GG":        (48, 82),
-        "NG":        (25, 65),
-        "HOME WIN":  (33, 82),   # 1X2 — any conviction above 33% is signal
-        "AWAY WIN":  (25, 75),
-        "DRAW":      (22, 45),
-    }
-    lo, hi = norm_map.get(tip, (33, 90))
-    s_prob = max(0.0, min(1.0, (prob - lo) / max(hi - lo, 1)))
-
-    # Extra boost for 1X2 when independent signals strongly agree
-    if tip in ("HOME WIN", "AWAY WIN") and s_xg > 0.62 and s_form > 0.58:
-        s_prob = min(s_prob * 1.3, 1.0)
-    elif tip == "DRAW" and s_xg > 0.7 and s_form > 0.65:
-        s_prob = min(s_prob * 1.2, 1.0)
-
-    raw = (s_prob * 0.30 + s_xg * 0.28 + s_form * 0.22 +
-           s_standing * 0.12 + s_value * 0.08)
-    return round(raw * 100, 2)
-
-# ── Reason builder ────────────────────────────────────────────────────────────
-
-def _reason(tip, h_xg, a_xg, h_form, a_form, h_stand, a_stand, prob, odds, h_name, a_name):
-    signals = {
-        "xG":   _xg_signal(tip, h_xg, a_xg),
-        "form": min(_form_signal(tip, h_form, a_form), 1.0),
-        "pos":  _standing_signal(tip, h_stand, a_stand),
-    }
-    top = max(signals, key=signals.get)
-    edge = value_edge(prob, odds)
-    ev = f" — bookmaker underpricing by {edge}%" if edge and edge > 3 else ""
-    h = h_name.split()[0]; a = a_name.split()[0]
-    total_xg = round(h_xg + a_xg, 2)
-
-    templates = {
-        ("xG","HOME WIN"):  f"{h} generating more xG ({h_xg:.2f} vs {a_xg:.2f}) — clear home dominance in chance creation{ev}",
-        ("xG","AWAY WIN"):  f"{a} creating more chances per game ({a_xg:.2f} xG vs {h_xg:.2f}) — away threat is real{ev}",
-        ("xG","DRAW"):      f"xG almost identical ({h_xg:.2f} vs {a_xg:.2f}) — neither side pulling away in quality{ev}",
-        ("xG","GG"):        f"Both teams generating real chances — {h} {h_xg:.2f} xG, {a} {a_xg:.2f} xG. Both likely to score{ev}",
-        ("xG","NG"):        f"Limited chance creation overall — xG total only {total_xg}. Clean sheet possible{ev}",
-        ("xG","OVER 1.5"):  f"Combined xG of {total_xg} strongly supports a goals game{ev}",
-        ("xG","OVER 2.5"):  f"High combined xG ({total_xg}) — multi-goal game on{ev}",
-        ("xG","OVER 3.5"):  f"Both teams creating heavily — {total_xg} combined xG backs goals{ev}",
-        ("xG","UNDER 2.5"): f"Low combined xG ({total_xg}) — tight match, under has edge{ev}",
-        ("form","HOME WIN"):f"{h} in strong form recently · {a} not travelling well{ev}",
-        ("form","AWAY WIN"):f"{a} arrive in excellent form · {h} poor run at home{ev}",
-        ("form","DRAW"):    f"Both sides drawing frequently — form points to a stalemate{ev}",
-        ("form","GG"):      f"Both teams have been scoring consistently in recent fixtures{ev}",
-        ("form","OVER 1.5"):f"Recent games for both sides have produced goals{ev}",
-        ("form","OVER 2.5"):f"Both teams involved in high-scoring games recently{ev}",
-        ("pos","HOME WIN"): f"{h} significantly superior in the table (#{h_stand} vs #{a_stand}){ev}",
-        ("pos","AWAY WIN"):f"{a} punching above their odds — #{a_stand} vs #{h_stand} in the table{ev}",
-        ("pos","DRAW"):     f"Closely matched league positions — #{h_stand} vs #{a_stand}{ev}",
-        ("pos","GG"):       f"Both quality sides — neither likely to keep a clean sheet{ev}",
-    }
-    return templates.get((top, tip), f"{prob:.0f}% probability — multiple signals in agreement{ev}")
-
-# ── THREE-TIER TIP SELECTION ──────────────────────────────────────────────────
-
-def _pick_recommended(h_win, draw, a_win, o15, o25, o35, btts, gg_p, ng_p,
-                      h_xg, a_xg, h_form, a_form, h_stand, a_stand,
-                      odds_h, odds_d, odds_a, odds_o15, odds_o25, odds_btts):
-    """
-    RECOMMENDED TIP — Market hierarchy rules:
-      - DRAW is BANNED from Recommended. Draws belong in Risky.
-      - OVER 1.5 is BANNED from Recommended. Too basic — belongs in Safest.
-      - NG (No Goals) is BANNED. Rarely meaningful.
-      - Minimum probability threshold: tip must be >= 45% to qualify.
-      - If only Over 1.5 / Draw qualify, fall back to HOME WIN or AWAY WIN.
-    Valid markets: HOME WIN, AWAY WIN, GG, OVER 2.5, OVER 3.5, UNDER 2.5
-    """
-    candidates = {
-        "HOME WIN":  (h_win,  odds_h),
-        "AWAY WIN":  (a_win,  odds_a),
-        "GG":        (gg_p,   odds_btts),
-        "OVER 2.5":  (o25,    odds_o25),
-        "OVER 3.5":  (o35,    None),
-        "UNDER 2.5": (100-o25, None),
-    }
-    scores = {}
-    for tip, (prob, odds) in candidates.items():
-        scores[tip] = conviction_score(tip, prob, odds, h_xg, a_xg,
-                                       h_form, a_form, h_stand, a_stand)
-    # Only consider tips with prob >= 40%
-    valid = {t: s for t, s in scores.items() if candidates[t][0] >= 40}
-    if not valid:
-        valid = scores  # fallback: use all if none qualify
-    best = max(valid, key=valid.get)
-    prob, odds = candidates[best]
-    return best, round(prob, 1), scores[best], odds, scores
-
-def _pick_safest(rec_tip, h_win, draw, a_win, o15, h_xg, a_xg, h_form, a_form,
-                 odds_h, odds_d, odds_a):
-    """
-    SAFEST TIP: Over 1.5 Goals, Double Chance (1X/X2/12), Win Either Half
-    Always low-risk, high-probability options.
-    """
-    dc_1x  = round(h_win + draw, 1)    # 1X
-    dc_x2  = round(draw + a_win, 1)    # X2
-    dc_12  = round(h_win + a_win, 1)   # 12 (either team wins)
-
-    # Double chance odds (approximate: 1 / implied_prob)
-    odds_1x = round(1 / (dc_1x/100), 2) if dc_1x > 0 else None
-    odds_x2 = round(1 / (dc_x2/100), 2) if dc_x2 > 0 else None
-    odds_12 = round(1 / (dc_12/100), 2) if dc_12 > 0 else None
-
-    candidates = [
-        ("OVER 1.5 GOALS",    o15,   None),
-        ("DOUBLE CHANCE 1X",  dc_1x, odds_1x),
-        ("DOUBLE CHANCE X2",  dc_x2, odds_x2),
-        ("DOUBLE CHANCE 12",  dc_12, odds_12),
-    ]
-
-    # Win Either Half — approximate from 1X2
-    # P(home wins either half) ≈ P(home win) * 1.4 capped at 92
-    h_weh = min(round(h_win * 1.35, 1), 92.0)
-    a_weh = min(round(a_win * 1.35, 1), 88.0)
-    if h_win > a_win:
-        candidates.append(("HOME WIN EITHER HALF", h_weh, None))
-    else:
-        candidates.append(("AWAY WIN EITHER HALF", a_weh, None))
-
-    # Remove if same as recommended
-    candidates = [(t, p, o) for t, p, o in candidates if t != rec_tip]
-
-    # Pick highest-probability safe tip (this slot is for stake protection)
-    best = max(candidates, key=lambda x: x[1])
-    # Always round probability to 1 decimal
-    return best[0], round(best[1], 1), best[2]
-
-def _pick_risky(h_win, draw, a_win, o15, o25, btts,
-                h_xg, a_xg, h_form, a_form,
-                odds_h, odds_a, odds_o25, odds_btts):
-    """
-    RISKY MARKET: DRAW, HT/FT, Combo tips (1X2+GG, 1X2+Overs, WIN+Overs)
-    Draws live here — they are specialist high-risk selections.
-    """
-    combos = []
-
-    # DRAW in risky ONLY when genuinely competitive:
-    # - Draw probability >= 28% (truly contested match)
-    # - AND draw is within 12% of the leading outcome (not just a side result)
-    # This stops DRAW polluting every single risky section
-    leading_win = max(h_win, a_win)
-    draw_competitive = draw >= 28 and (leading_win - draw) <= 14
-    if draw_competitive:
-        draw_odds = round(1 / (draw/100), 2)
-        combos.append({
-            "tip":  "DRAW",
-            "prob": round(draw, 1),
-            "odds": round(draw_odds, 2),
-        })
-
-    # 1X2 + GG combos
-    if h_win > a_win:
-        combos.append({
-            "tip":  "HOME WIN & GG",
-            "prob": round(h_win/100 * btts/100 * 100, 1),
-            "odds": round((1/(h_win/100)) * (1/(btts/100)), 2),
-        })
-        combos.append({
-            "tip":  "HOME WIN & OVER 2.5",
-            "prob": round(h_win/100 * o25/100 * 100, 1),
-            "odds": round((1/(h_win/100)) * (1/(o25/100)), 2),
-        })
-    else:
-        combos.append({
-            "tip":  "AWAY WIN & GG",
-            "prob": round(a_win/100 * btts/100 * 100, 1),
-            "odds": round((1/(a_win/100)) * (1/(btts/100)), 2),
-        })
-        combos.append({
-            "tip":  "AWAY WIN & OVER 2.5",
-            "prob": round(a_win/100 * o25/100 * 100, 1),
-            "odds": round((1/(a_win/100)) * (1/(o25/100)), 2),
-        })
-
-    combos.append({
-        "tip":  "GG & OVER 2.5",
-        "prob": round(btts/100 * o25/100 * 100, 1),
-        "odds": round((1/(btts/100)) * (1/(o25/100)), 2),
+players = []
+for entry in data:
+    p     = entry.get("player", {})
+    stats = entry.get("statistics", [{}])[0]
+    games = stats.get("games", {})
+    goals = stats.get("goals", {})
+    shots = stats.get("shots", {})
+    passes= stats.get("passes", {})
+    mins  = games.get("minutes") or 0
+    try:
+        rating = round(float(games.get("rating") or 0), 3)
+    except:
+        rating = 0.0
+    if not rating or rating < 1.0 or mins < 90:
+        continue
+    players.append({
+        "id":         p.get("id"),
+        "name":       p.get("name", "?"),
+        "position":   games.get("position", "Midfielder"),
+        "rating":     rating,
+        "minutes":    mins,
+        "goals":      goals.get("total") or 0,
+        "assists":    goals.get("assists") or 0,
+        "shots_on":   shots.get("on") or 0,
+        "key_passes": passes.get("key") or 0,
+        "injured":    p.get("injured", False),
     })
 
-    # HT/FT - most common: home team leads at HT and wins FT
-    if h_win > a_win:
-        ht_ft_prob = round(h_win * 0.55, 1)   # rough: home HT/FT ≈ 55% of home win prob
-        combos.append({"tip": f"HT/FT: HOME / HOME", "prob": ht_ft_prob, "odds": round(100/max(ht_ft_prob,1), 2)})
+players.sort(key=lambda x: x["minutes"], reverse=True)
+database.cache_set("h2h_cache", ck, json.dumps(players))
+return players
+```
+
+def compute_squad_strength(players, injury_list=None):
+“””
+Squad Strength Index (0-100).
+
+```
+Steps:
+  1. Group by position
+  2. Top-N weighted average rating per position
+  3. Position-weighted composite (Attacker 40%, Mid 35%, Def 20%, GK 5%)
+  4. Scale: 6.0 rating = 30 strength, 7.0 = 70, 8.0 = 100+
+  5. Injury penalty: -8% xG multiplier per missing key player
+
+Returns score, attack, defense, penalty multiplier, top players list.
+"""
+if not players:
+    return _default_squad()
+
+inj_names = set()
+if injury_list:
+    inj_names = {i.get("name","").lower() for i in injury_list}
+
+by_pos = {"Attacker":[], "Midfielder":[], "Defender":[], "Goalkeeper":[]}
+for p in players:
+    pos = p.get("position", "Midfielder")
+    if pos in by_pos:
+        by_pos[pos].append(p)
+
+top_n   = {"Attacker":2, "Midfielder":3, "Defender":4, "Goalkeeper":1}
+pos_avg = {}
+for pos, limit in top_n.items():
+    pool = sorted(by_pos[pos], key=lambda x: x["rating"], reverse=True)[:limit]
+    pos_avg[pos] = (sum(p["rating"] for p in pool) / len(pool)) if pool else 6.5
+
+raw    = sum(pos_avg[pos] * w for pos, w in POSITION_WEIGHTS.items())
+score  = max(0, min(100, (raw - 6.0) * 40))
+atk    = max(0, min(100, (pos_avg["Attacker"]*0.55 + pos_avg["Midfielder"]*0.45 - 6.0) * 40))
+def_s  = max(0, min(100, (pos_avg["Defender"]*0.65 + pos_avg["Goalkeeper"]*0.35 - 6.0) * 40))
+
+# Key player injury check: top-3 attackers + goalkeeper
+key_pool = (sorted(by_pos["Attacker"],   key=lambda x: x["rating"], reverse=True)[:3] +
+            sorted(by_pos["Goalkeeper"],  key=lambda x: x["rating"], reverse=True)[:1])
+key_missing = sum(
+    1 for kp in key_pool
+    if kp.get("injured") or any(inj in kp["name"].lower() for inj in inj_names)
+)
+penalty = round(max(0.70, 1.0 - key_missing * 0.08), 3)
+
+return {
+    "score":        round(score, 1),
+    "attack":       round(atk,  1),
+    "defense":      round(def_s, 1),
+    "key_missing":  key_missing,
+    "penalty":      penalty,
+    "top_players":  sorted(players, key=lambda x: x["rating"], reverse=True)[:3],
+    "player_count": len(players),
+}
+```
+
+def _default_squad():
+return {“score”:50.0, “attack”:50.0, “defense”:50.0,
+“key_missing”:0, “penalty”:1.0, “top_players”:[], “player_count”:0}
+
+# ═══════════════════════════════════════════════════════════════
+
+# LAYER 2 — ROLLING xG (zero extra API calls)
+
+# ═══════════════════════════════════════════════════════════════
+
+def compute_rolling_xg(last_matches, team_name):
+“””
+Compute rolling xG proxy from last 5 match goals.
+Zero additional API calls — uses already-fetched fixture data.
+
+```
+Returns rolling_for, rolling_against, trend, momentum_factor.
+momentum_factor: 0.88 (falling) → 1.0 (stable) → 1.12 (rising)
+"""
+if not last_matches:
+    return {"rolling_for":1.2, "rolling_against":1.0,
+            "trend":"STABLE", "momentum_factor":1.0}
+
+scored = []; conceded = []
+for m in last_matches[:5]:
+    hg = m.get("home_goals") or 0
+    ag = m.get("away_goals") or 0
+    if m.get("home","") == team_name:
+        scored.append(hg); conceded.append(ag)
     else:
-        ht_ft_prob = round(a_win * 0.52, 1)
-        combos.append({"tip": f"HT/FT: AWAY / AWAY", "prob": ht_ft_prob, "odds": round(100/max(ht_ft_prob,1), 2)})
+        scored.append(ag); conceded.append(hg)
 
-    # Filter: keep combos with prob > 15% and reasonable odds
-    draw_entry = next((c for c in combos if c["tip"] == "DRAW"), None)
-    other_combos = [c for c in combos if c["tip"] != "DRAW"
-                    and c["prob"] >= 15 and c["odds"] <= 25]
-    other_combos.sort(key=lambda x: x["prob"], reverse=True)
+n = len(scored)
+if n == 0:
+    return {"rolling_for":1.2, "rolling_against":1.0,
+            "trend":"STABLE", "momentum_factor":1.0}
 
-    # Show DRAW first in risky only if it genuinely qualified (>= 28% + competitive)
-    result = []
-    if draw_entry and draw_entry["prob"] >= 28:
-        result.append(draw_entry)
-    result.extend(other_combos[:3])  # up to 3 combos after draw
+avg_for     = round(sum(scored) / n, 3)
+avg_against = round(sum(conceded) / n, 3)
+trend = "STABLE"; mf = 1.0
 
-    if not result:
-        result = [{"tip": "GG & OVER 1.5",
-                   "prob": round(btts/100 * o15/100 * 100, 1),
-                   "odds": round(1/(btts/100) * 1/(o15/100), 2)}]
-    return result[:4]
+if n >= 4:
+    recent  = sum(scored[:2]) / 2
+    earlier = sum(scored[2:]) / max(n-2, 1)
+    diff    = recent - earlier
+    if   diff >=  0.5: trend = "RISING";  mf = 1.12
+    elif diff <= -0.5: trend = "FALLING"; mf = 0.88
+    else:              mf = round(1.0 + diff * 0.1, 3)
 
+return {"rolling_for": avg_for, "rolling_against": avg_against,
+        "trend": trend, "momentum_factor": round(mf, 3)}
+```
 
-def _goals_from_xg(h_xg, a_xg):
-    """
-    Recalculate Over 2.5, Over 1.5, BTTS probabilities from adjusted xG
-    using Poisson distribution. Called when squad/rolling adjustments change xG.
-    """
-    o25 = o15 = 0.0
-    btts_h = btts_a = 0.0
-    for hg in range(10):
-        ph = poisson_pmf(hg, h_xg)
-        for ag in range(10):
-            pa    = poisson_pmf(ag, a_xg)
-            joint = ph * pa
-            total = hg + ag
-            if total > 2: o25  += joint
-            if total > 1: o15  += joint
-        if hg > 0: btts_h += ph
-    for ag in range(10):
-        pa = poisson_pmf(ag, a_xg)
-        if ag > 0: btts_a += pa
-    btts = btts_h * btts_a
-    return round(o25*100,2), round(o15*100,2), round(btts*100,2)
+# ═══════════════════════════════════════════════════════════════
 
-# ── MAIN ANALYSIS ─────────────────────────────────────────────────────────────
+# LAYER 3 — HOME/AWAY SPLITS (zero extra API calls)
 
-def analyze_match(api_data, league_id=None, enriched=None):
-    """
-    Core analysis with three enrichment layers wired in:
+# ═══════════════════════════════════════════════════════════════
 
-    LAYER 1 — Squad Strength Index
-      enriched["home_squad"] / ["away_squad"] → penalty multiplier on xG
-      A team missing 2 key attackers gets an 84% xG multiplier (−16%)
-      Attack/defense scores shift home/away win probabilities
+def parse_home_away_splits(raw_stats):
+“””
+Extract venue-split stats from /teams/statistics raw response.
+Called inside get_team_stats — no extra API call.
+“””
+if not raw_stats:
+return None
+s   = raw_stats[0] if isinstance(raw_stats, list) else raw_stats
+fix = s.get(“fixtures”, {})
+gf  = s.get(“goals”, {}).get(“for”, {})
+ga  = s.get(“goals”, {}).get(“against”, {})
 
-    LAYER 2 — Rolling xG
-      enriched["home_rolling_xg"] / ["away_rolling_xg"]
-      Replaces season-average xG with last-5-match goals average
-      Trend momentum factor: RISING→×1.12, FALLING→×0.88
-
-    LAYER 3 — Home/Away Splits
-      enriched["home_stats"]["splits"] / ["away_stats"]["splits"]
-      Home win rate at home, away win rate on the road — venue-specific
-      Boosts or dampens 1X2 conviction based on actual venue record
-    """
+```
+def si(d, *ks):
     try:
-        event  = api_data.get("event", {})
-        l_id   = league_id or event.get("league", {}).get("id", 1)
-        h_name = event.get("home_team", "Home")
-        a_name = event.get("away_team", "Away")
+        v = d
+        for k in ks: v = v[k]
+        return int(v or 0)
+    except: return 0
 
-        h_win  = float(api_data.get("prob_home_win",  33.3))
-        draw   = float(api_data.get("prob_draw",      33.3))
-        a_win  = float(api_data.get("prob_away_win",  33.3))
-        o15    = float(api_data.get("prob_over_15",   70.0))
-        o25    = float(api_data.get("prob_over_25",   50.0))
-        o35    = float(api_data.get("prob_over_35",   25.0))
-        btts   = float(api_data.get("prob_btts_yes",  50.0))
-        h_xg   = float(api_data.get("expected_home_goals", 1.2))
-        a_xg   = float(api_data.get("expected_away_goals", 1.0))
-        conf   = float(api_data.get("confidence",     40.0))
-        gg_p   = btts
-        ng_p   = round(100 - btts, 1)
+def sf(d, *ks):
+    try:
+        v = d
+        for k in ks: v = v[k]
+        return float(v or 0)
+    except: return 0.0
 
-        # Form: prefer API Football real data over Bzzoiro's
-        h_form = (enriched.get("home_form") if enriched else None) or api_data.get("home_form", [])
-        a_form = (enriched.get("away_form") if enriched else None) or api_data.get("away_form", [])
-        h_stand = api_data.get("home_standing")
-        a_stand = api_data.get("away_standing")
+hp = si(fix,"played","home") or 1
+ap = si(fix,"played","away") or 1
+return {
+    "home_played":   hp,
+    "away_played":   ap,
+    "home_wins":     si(fix,"wins","home"),
+    "away_wins":     si(fix,"wins","away"),
+    "home_draws":    si(fix,"draws","home"),
+    "away_draws":    si(fix,"draws","away"),
+    "home_losses":   si(fix,"loses","home"),
+    "away_losses":   si(fix,"loses","away"),
+    "home_win_rate": round(si(fix,"wins","home") / hp, 3),
+    "away_win_rate": round(si(fix,"wins","away") / ap, 3),
+    "home_gf_avg":   sf(gf,"average","home"),
+    "home_ga_avg":   sf(ga,"average","home"),
+    "away_gf_avg":   sf(gf,"average","away"),
+    "away_ga_avg":   sf(ga,"average","away"),
+}
+```
 
-        # Bookmaker odds
-        odds_h    = event.get("odds_home")
-        odds_d    = event.get("odds_draw")
-        odds_a    = event.get("odds_away")
-        odds_o15  = event.get("odds_over_15")
-        odds_o25  = event.get("odds_over_25")
-        odds_btts = event.get("odds_btts_yes")
+# ═══════════════════════════════════════════════════════════════
 
-        # ══════════════════════════════════════════════════
-        # LAYER 2 — Rolling xG adjustment
-        # Replaces base xG with recent-form goals average.
-        # Falls back to Bzzoiro xG if no rolling data.
-        # ══════════════════════════════════════════════════
-        h_rxg = enriched.get("home_rolling_xg") if enriched else None
-        a_rxg = enriched.get("away_rolling_xg") if enriched else None
+# BATCH JOB — 6am WAT daily pre-fetch
 
-        if h_rxg and h_rxg["rolling_for"] > 0:
-            # Blend: 60% rolling, 40% season xG — don't fully abandon season data
-            h_xg = round(h_rxg["rolling_for"] * 0.60 + h_xg * 0.40, 3)
-            h_xg *= h_rxg["momentum_factor"]  # RISING→×1.12, FALLING→×0.88
-            h_xg = round(max(0.3, h_xg), 3)
+# ═══════════════════════════════════════════════════════════════
 
-        if a_rxg and a_rxg["rolling_for"] > 0:
-            a_xg = round(a_rxg["rolling_for"] * 0.60 + a_xg * 0.40, 3)
-            a_xg *= a_rxg["momentum_factor"]
-            a_xg = round(max(0.3, a_xg), 3)
+def run_daily_batch(today_matches):
+“””
+Pre-fetch squad stats for all teams playing today.
+Skips teams already in 24h cache. Rate-limited at 5 req/sec.
+Returns call count for monitoring.
+“””
+made = 0; skipped = 0; seen = set()
 
-        # ══════════════════════════════════════════════════
-        # LAYER 1 — Squad Strength: xG penalty + prob adjustment
-        # Applied AFTER rolling xG so both layers stack.
-        # ══════════════════════════════════════════════════
-        h_sq = enriched.get("home_squad") if enriched else None
-        a_sq = enriched.get("away_squad") if enriched else None
-
-        squad_intel = {"home_score": 50, "away_score": 50,
-                       "home_atk": 50, "away_atk": 50,
-                       "home_penalty": 1.0, "away_penalty": 1.0,
-                       "home_missing": 0, "away_missing": 0}
-
-        if h_sq and h_sq["player_count"] > 0:
-            # Injury penalty reduces attacking xG
-            h_xg = round(h_xg * h_sq["penalty"], 3)
-            squad_intel["home_score"]   = h_sq["score"]
-            squad_intel["home_atk"]     = h_sq["attack"]
-            squad_intel["home_penalty"] = h_sq["penalty"]
-            squad_intel["home_missing"] = h_sq["key_missing"]
-            # Squad attack differential nudges win probability
-            # A team with 80 attack vs opponent 40 defense gets a small boost
-            if a_sq and a_sq["player_count"] > 0:
-                atk_edge = (h_sq["attack"] - a_sq["defense"]) / 100
-                h_win = min(98, h_win + atk_edge * 4)   # max 4% swing per direction
-                h_win = max(5,  h_win)
-
-        if a_sq and a_sq["player_count"] > 0:
-            a_xg = round(a_xg * a_sq["penalty"], 3)
-            squad_intel["away_score"]   = a_sq["score"]
-            squad_intel["away_atk"]     = a_sq["attack"]
-            squad_intel["away_penalty"] = a_sq["penalty"]
-            squad_intel["away_missing"] = a_sq["key_missing"]
-            if h_sq and h_sq["player_count"] > 0:
-                atk_edge = (a_sq["attack"] - h_sq["defense"]) / 100
-                a_win = min(98, a_win + atk_edge * 4)
-                a_win = max(5,  a_win)
-
-        # Re-normalise 1X2 after adjustments
-        total_1x2 = h_win + draw + a_win
-        if total_1x2 > 0 and abs(total_1x2 - 100) > 1:
-            h_win = round(h_win / total_1x2 * 100, 2)
-            draw  = round(draw  / total_1x2 * 100, 2)
-            a_win = round(a_win / total_1x2 * 100, 2)
-
-        # ══════════════════════════════════════════════════
-        # LAYER 3 — Home/Away splits: venue conviction boost
-        # Applied to xG signals used in conviction scoring.
-        # ══════════════════════════════════════════════════
-        venue_boost_h = 1.0
-        venue_boost_a = 1.0
-        h_stats = enriched.get("home_stats") if enriched else None
-        a_stats = enriched.get("away_stats") if enriched else None
-
-        if h_stats and h_stats.get("splits"):
-            sp = h_stats["splits"]
-            hwr = sp.get("home_win_rate", 0.5)
-            # If home team wins at home > 60%, boost home xG signal slightly
-            # If < 30%, penalise — they're genuinely bad at home
-            if hwr >= 0.60:   venue_boost_h = 1.10
-            elif hwr >= 0.50: venue_boost_h = 1.05
-            elif hwr <= 0.30: venue_boost_h = 0.90
-            h_xg = round(h_xg * venue_boost_h, 3)
-
-        if a_stats and a_stats.get("splits"):
-            sp = a_stats["splits"]
-            awr = sp.get("away_win_rate", 0.3)
-            # Away teams winning on the road > 40% → genuinely dangerous away
-            if awr >= 0.40:   venue_boost_a = 1.08
-            elif awr >= 0.30: venue_boost_a = 1.02
-            elif awr <= 0.15: venue_boost_a = 0.90
-            a_xg = round(a_xg * venue_boost_a, 3)
-
-        # Recalculate goal market probabilities from adjusted xG using Poisson
-        # This is the key step — all three layers flow through to the final markets
-        if (h_sq or h_rxg) and (h_xg != float(api_data.get("expected_home_goals", 1.2)) or
-                                  a_xg != float(api_data.get("expected_away_goals", 1.0))):
-            o25_adj, o15_adj, btts_adj = _goals_from_xg(h_xg, a_xg)
-            # Blend: 50% model recalc, 50% Bzzoiro original (don't fully override)
-            o25  = round(o25  * 0.5 + o25_adj  * 0.5, 2)
-            o15  = round(o15  * 0.5 + o15_adj  * 0.5, 2)
-            btts = round(btts * 0.5 + btts_adj * 0.5, 2)
-            gg_p = btts
-            ng_p = round(100 - btts, 1)
-
-        # ── RECOMMENDED TIP ──
-        rec_tip, rec_prob, rec_conv, rec_odds, all_scores = _pick_recommended(
-            h_win, draw, a_win, o15, o25, o35, btts, gg_p, ng_p,
-            h_xg, a_xg, h_form, a_form, h_stand, a_stand,
-            odds_h, odds_d, odds_a, odds_o15, odds_o25, odds_btts
-        )
-        rec_fair_odds = round(100 / max(rec_prob, 1), 2)
-        rec_edge      = value_edge(rec_prob, {
-            "HOME WIN": odds_h, "DRAW": odds_d, "AWAY WIN": odds_a,
-            "GG": odds_btts, "OVER 1.5": odds_o15, "OVER 2.5": odds_o25,
-        }.get(rec_tip))
-        rec_agree = _agreement_count(rec_tip, h_xg, a_xg, h_form, a_form, h_stand, a_stand)
-        rec_reason = _reason(rec_tip, h_xg, a_xg, h_form, a_form, h_stand, a_stand,
-                             rec_prob, {
-                                 "HOME WIN": odds_h, "DRAW": odds_d, "AWAY WIN": odds_a,
-                                 "GG": odds_btts, "OVER 2.5": odds_o25,
-                             }.get(rec_tip), h_name, a_name)
-
-        # ── SAFEST TIP ──
-        safe_tip, safe_prob, safe_fair_odds = _pick_safest(
-            rec_tip, h_win, draw, a_win, o15, h_xg, a_xg, h_form, a_form,
-            odds_h, odds_d, odds_a
-        )
-
-        # ── RISKY COMBOS ──
-        risky_list = _pick_risky(
-            h_win, draw, a_win, o15, o25, btts,
-            h_xg, a_xg, h_form, a_form,
-            odds_h, odds_a, odds_o25, odds_btts
-        )
-        risky_main = risky_list[0]
-
-        # ── Smart tagging system ──
-        # Slump detection: 3+ consecutive losses
-        h_slump = (list(h_form[-3:]).count("L") >= 3) if len(h_form) >= 3 else False
-        a_slump = (list(a_form[-3:]).count("L") >= 3) if len(a_form) >= 3 else False
-        fav_win = max(h_win, a_win)
-        has_injuries = enriched and (enriched.get("home_injuries") or enriched.get("away_injuries"))
-
-        # SURE MATCH: dominant favourite (>85%), signals mostly agree, no slump
-        if fav_win >= 85 and rec_agree >= 1 and not h_slump and not a_slump and rec_conv >= 60:
-            tag = "✅ SURE MATCH"
-        # AVOID: slump OR key injuries AND low conviction
-        elif (h_slump or a_slump) and has_injuries and rec_conv < 55:
-            tag = "⚠️ AVOID"
-        # AVOID: match is too unpredictable (all probs close to 33%)
-        elif abs(h_win - draw) < 5 and abs(draw - a_win) < 5 and rec_conv < 45:
-            tag = "⚠️ AVOID"
-        # RELIABLE: all 3 signals agree, high conviction
-        elif rec_agree >= 3 and rec_conv >= 60:
-            tag = "🛡️ RELIABLE"
-        elif rec_conv >= 65 and rec_agree >= 2:
-            tag = "ELITE PICK"
-        elif rec_conv >= 55 and rec_agree >= 1:
-            tag = "STRONG PICK"
-        elif rec_conv >= 42:
-            tag = "SOLID TIP"
-        else:
-            tag = "MONITOR"
-
-        return {
-            "tag":       tag,
-            "xg_h":      round(h_xg, 2),
-            "xg_a":      round(a_xg, 2),
-            "squad_intel": squad_intel,
-            "1x2":       {"home": round(h_win,1), "draw": round(draw,1), "away": round(a_win,1)},
-            "markets":   {"over_15": round(o15,1), "over_25": round(o25,1),
-                          "over_35": round(o35,1), "under_25": round(100-o25,1),
-                          "btts": round(btts,1), "gg": round(gg_p,1), "ng": round(ng_p,1)},
-            # Tip tiers
-            "recommended": {
-                "tip":    rec_tip,
-                "prob":   round(rec_prob, 1),
-                "odds":   rec_fair_odds,
-                "edge":   rec_edge,
-                "conv":   round(rec_conv, 1),
-                "agree":  rec_agree,
-                "reason": rec_reason,
-            },
-            "safest": {
-                "tip":    safe_tip,
-                "prob":   safe_prob,
-                "odds":   safe_fair_odds,
-            },
-            "risky":      risky_list,
-            "risky_main": risky_main,
-            # Legacy compatibility
-            "rec":     {"t": rec_tip, "p": rec_prob, "odds": rec_fair_odds, "edge": rec_edge},
-            "second":  {"t": safe_tip, "p": safe_prob},
-            "confidence":   round(conf, 1),
-            "momentum":     momentum_score(h_form, a_form, h_xg, a_xg),
-            "style":        style_profile(h_xg, a_xg, btts),
-            "form":         {"home": list(h_form)[-5:], "away": list(a_form)[-5:]},
-            "standings":    {"home": h_stand, "away": a_stand},
-        }
-    except Exception as e:
-        import traceback
-        print(f"[Predictor] {e}\n{traceback.format_exc()}")
-        return None
-
-def pick_acca(matches, n=5, min_conv=45.0):
-    """
-    Professional ACCA builder with strict quality gates.
-
-    Rules (hard gates - all must pass):
-      - Fair odds >= 1.25 per leg   (no junk odds)
-      - No AVOID or VERSATILE tags  (reliability required)
-      - No OVER 1.5 tips            (too low value)
-      - No DRAW tips                (specialist bet, kills accas)
-      - 1 pick per league max       (diversification)
-      - 1 pick per tip type max     (diversification)
-      - Minimum conviction 45
-    """
-    BLOCKED_TIPS = {"OVER 1.5", "DRAW"}
-    BLOCKED_TAGS = {"⚠️ AVOID", "🔄 VERSATILE"}
-    MIN_ODDS     = 1.25
-
-    scored = []
-    for m in matches:
-        l_id = m.get("event", {}).get("league", {}).get("id", 0)
-        res  = analyze_match(m, l_id)
-        if not res:
+```
+for m in today_matches:
+    event    = m.get("event", {})
+    our_l_id = event.get("league", {}).get("id", 0)
+    ext_l_id = LEAGUE_ID_MAP.get(our_l_id)
+    if not ext_l_id:
+        continue
+    for side in ("home_team_obj", "away_team_obj"):
+        t_id = (event.get(side) or {}).get("api_id")
+        if not t_id or t_id in seen:
             continue
-        rec  = res["recommended"]
-        if rec["conv"] < min_conv:       continue
-        if rec["odds"] < MIN_ODDS:       continue
-        if rec["tip"] in BLOCKED_TIPS:   continue
-        if res.get("tag","") in BLOCKED_TAGS: continue
-        scored.append({"match": m, "result": res, "conv": rec["conv"], "league_id": l_id})
+        seen.add(t_id)
+        ck = f"squad_{t_id}_{ext_l_id}_{CURRENT_SEASON}"
+        if database.cache_get("h2h_cache", ck, max_age_hours=22):
+            skipped += 1
+            continue
+        get_squad_stats(t_id, ext_l_id)
+        made += 1
+        time.sleep(0.25)
 
-    scored.sort(key=lambda x: x["conv"], reverse=True)
+print(f"[batch] done — {made} fetched, {skipped} cached | quota: {get_quota_status()}")
+return {"calls_made": made, "calls_skipped": skipped}
+```
 
-    picks = []; league_used = set(); tip_used = {}
-    for s in scored:
-        lg  = s["league_id"]
-        tip = s["result"]["recommended"]["tip"]
-        if lg in league_used:          continue
-        if tip_used.get(tip, 0) >= 1:  continue
-        league_used.add(lg)
-        tip_used[tip] = tip_used.get(tip, 0) + 1
-        picks.append(s)
-        if len(picks) >= n: break
+# ═══════════════════════════════════════════════════════════════
 
-    combined = 1.0
-    for p in picks:
-        combined *= p["result"]["recommended"]["odds"]
-    return picks, round(combined, 2)
+# EXISTING FUNCTIONS — H2H, last matches, injuries, stats, standings
+
+# Injury cache extended: 4h → 12h to protect quota
+
+# ═══════════════════════════════════════════════════════════════
+
+def get_h2h(home_api_id, away_api_id, last=8):
+if not home_api_id or not away_api_id: return []
+ck = f”h2h_{min(home_api_id,away_api_id)}_{max(home_api_id,away_api_id)}”
+cached = database.cache_get(“h2h_cache”, ck, max_age_hours=24)
+if cached:
+try: return json.loads(cached)
+except: pass
+data = _get(”/fixtures/headtohead”,
+{“h2h”: f”{home_api_id}-{away_api_id}”, “last”: last, “status”: “FT”})
+if not data: return []
+results = []
+for f in data:
+fix   = f.get(“fixture”,{}); teams = f.get(“teams”,{})
+goals = f.get(“goals”,{});   score = f.get(“score”,{})
+ht    = score.get(“halftime”,{})
+results.append({
+“date”:       fix.get(“date”,””)[:10],
+“home”:       teams.get(“home”,{}).get(“name”,”?”),
+“away”:       teams.get(“away”,{}).get(“name”,”?”),
+“home_goals”: goals.get(“home”),
+“away_goals”: goals.get(“away”),
+“ht_home”:    ht.get(“home”),
+“ht_away”:    ht.get(“away”),
+“status”:     fix.get(“status”,{}).get(“short”,””),
+})
+database.cache_set(“h2h_cache”, ck, json.dumps(results))
+return results
+
+def summarise_h2h(h2h_list, home_name, away_name):
+if not h2h_list: return None
+fin = [m for m in h2h_list
+if m.get(“status”)==“FT” and m.get(“home_goals”) is not None]
+if not fin: return None
+hw=dr=aw=tg=o15=o25=btts_c=0
+for m in fin:
+hg=m[“home_goals”] or 0; ag=m[“away_goals”] or 0
+tg += hg+ag
+if hg+ag>1: o15+=1
+if hg+ag>2: o25+=1
+if hg>0 and ag>0: btts_c+=1
+if m[“home”]==home_name:
+if hg>ag: hw+=1
+elif hg==ag: dr+=1
+else: aw+=1
+else:
+if ag>hg: hw+=1
+elif hg==ag: dr+=1
+else: aw+=1
+n=len(fin)
+return {“total”:n,“home_wins”:hw,“draws”:dr,“away_wins”:aw,
+“avg_goals”:round(tg/n,2),“over_15_pct”:round(o15/n*100,1),
+“over_25_pct”:round(o25/n*100,1),“btts_pct”:round(btts_c/n*100,1),
+“matches”:fin}
+
+def get_last_matches(team_api_id, last=5):
+if not team_api_id: return []
+ck = f”last_{team_api_id}_{last}”
+cached = database.cache_get(“h2h_cache”, ck, max_age_hours=6)
+if cached:
+try: return json.loads(cached)
+except: pass
+data = _get(”/fixtures”, {“team”: team_api_id, “last”: last, “status”: “FT”})
+if not data: return []
+matches = []
+for f in data:
+fix=f.get(“fixture”,{}); teams=f.get(“teams”,{})
+goals=f.get(“goals”,{}); lg=f.get(“league”,{})
+matches.append({
+“date”:       fix.get(“date”,””)[:10],
+“home”:       teams.get(“home”,{}).get(“name”,”?”),
+“away”:       teams.get(“away”,{}).get(“name”,”?”),
+“home_goals”: goals.get(“home”),
+“away_goals”: goals.get(“away”),
+“league”:     lg.get(“name”,””),
+})
+matches.sort(key=lambda x: x[“date”], reverse=True)
+database.cache_set(“h2h_cache”, ck, json.dumps(matches))
+return matches
+
+def get_team_form_from_matches(matches, team_name):
+form = []
+for m in matches:
+hg=m.get(“home_goals”) or 0; ag=m.get(“away_goals”) or 0
+if m.get(“home”,””)==team_name:
+form.append(“W” if hg>ag else “D” if hg==ag else “L”)
+else:
+form.append(“W” if ag>hg else “D” if hg==ag else “L”)
+return form
+
+def get_injuries(team_api_id, league_api_id):
+if not team_api_id or not league_api_id: return []
+ck = f”inj_{team_api_id}_{league_api_id}”
+# Extended to 12h (was 4h) — injuries don’t change hourly, saves quota
+cached = database.cache_get(“injury_cache”, ck, max_age_hours=12)
+if cached:
+try: return json.loads(cached)
+except: pass
+data = _get(”/injuries”,
+{“team”: team_api_id, “league”: league_api_id, “season”: CURRENT_SEASON})
+if not data: return []
+injuries = [{“name”:   i.get(“player”,{}).get(“name”,”?”),
+“type”:   i.get(“injury”,{}).get(“type”,“Injured”),
+“reason”: i.get(“injury”,{}).get(“reason”,””)} for i in data[:8]]
+database.cache_set(“injury_cache”, ck, json.dumps(injuries))
+return injuries
+
+def get_team_stats(team_api_id, league_api_id):
+if not team_api_id or not league_api_id: return None
+ck = f”stats_{team_api_id}_{league_api_id}”
+cached = database.cache_get(“h2h_cache”, ck, max_age_hours=12)
+if cached:
+try: return json.loads(cached)
+except: pass
+data = _get(”/teams/statistics”,
+{“team”: team_api_id, “league”: league_api_id, “season”: CURRENT_SEASON})
+if not data: return None
+s   = data[0] if isinstance(data,list) else data
+gf  = s.get(“goals”,{}).get(“for”,{})
+ga  = s.get(“goals”,{}).get(“against”,{})
+fix = s.get(“fixtures”,{})
+stats = {
+“played”:           max(fix.get(“played”,{}).get(“total”,1) or 1, 1),
+“wins”:             fix.get(“wins”,{}).get(“total”,0),
+“draws”:            fix.get(“draws”,{}).get(“total”,0),
+“losses”:           fix.get(“loses”,{}).get(“total”,0),
+“goals_scored”:     gf.get(“total”,{}).get(“total”,0),
+“goals_conceded”:   ga.get(“total”,{}).get(“total”,0),
+“avg_scored”:       float(gf.get(“average”,{}).get(“total”,0) or 0),
+“avg_conceded”:     float(ga.get(“average”,{}).get(“total”,0) or 0),
+“clean_sheets”:     s.get(“clean_sheet”,{}).get(“total”,0),
+“failed_to_score”:  s.get(“failed_to_score”,{}).get(“total”,0),
+“form”:             s.get(“form”,””),
+“home_wins”:        fix.get(“wins”,{}).get(“home”,0),
+“away_wins”:        fix.get(“wins”,{}).get(“away”,0),
+# Layer 3: venue splits
+“splits”:           parse_home_away_splits(s),
+}
+database.cache_set(“h2h_cache”, ck, json.dumps(stats))
+return stats
+
+def get_standings(league_api_id):
+ck = f”standings_{league_api_id}”
+cached = database.cache_get(“h2h_cache”, ck, max_age_hours=6)
+if cached:
+try: return json.loads(cached)
+except: pass
+data = _get(”/standings”, {“league”: league_api_id, “season”: CURRENT_SEASON})
+if not data: return {}
+table = {}
+try:
+for team in data[0][“league”][“standings”][0]:
+tid = str(team[“team”][“id”])
+table[tid] = {
+“rank”: team.get(“rank”,0),
+“name”: team[“team”][“name”],
+“points”: team.get(“points”,0),
+“played”: team.get(“all”,{}).get(“played”,0),
+“gd”: team.get(“goalsDiff”,0),
+“form”: team.get(“form”,””),
+}
+except Exception as e:
+print(f”[standings] {e}”)
+database.cache_set(“h2h_cache”, ck, json.dumps(table))
+return table
+
+# ═══════════════════════════════════════════════════════════════
+
+# ENRICH MATCH
+
+# ═══════════════════════════════════════════════════════════════
+
+def enrich_match(api_data):
+enriched = {
+“h2h”:[], “h2h_summary”:None,
+“home_last”:[], “away_last”:[],
+“home_injuries”:[], “away_injuries”:[],
+“home_stats”:None, “away_stats”:None,
+“standings”:{}, “has_data”:False,
+“home_form”:[], “away_form”:[],
+# new
+“home_squad”:None, “away_squad”:None,
+“home_rolling_xg”:None, “away_rolling_xg”:None,
+}
+if not APIFOOTBALL_KEY:
+return enriched
+try:
+event       = api_data.get(“event”, {})
+our_l_id    = event.get(“league”,{}).get(“id”,0)
+ext_l_id    = LEAGUE_ID_MAP.get(our_l_id)
+home_obj    = event.get(“home_team_obj”,{}) or {}
+away_obj    = event.get(“away_team_obj”,{}) or {}
+h_ext       = home_obj.get(“api_id”)
+a_ext       = away_obj.get(“api_id”)
+h_name      = event.get(“home_team”,””)
+a_name      = event.get(“away_team”,””)
+
+```
+    if h_ext and a_ext:
+        enriched["h2h"]          = get_h2h(h_ext, a_ext)
+        enriched["h2h_summary"]  = summarise_h2h(enriched["h2h"], h_name, a_name)
+        enriched["home_last"]    = get_last_matches(h_ext)
+        enriched["away_last"]    = get_last_matches(a_ext)
+        enriched["home_form"]    = get_team_form_from_matches(enriched["home_last"], h_name)
+        enriched["away_form"]    = get_team_form_from_matches(enriched["away_last"], a_name)
+        # Layer 2: rolling xG — zero extra calls
+        enriched["home_rolling_xg"] = compute_rolling_xg(enriched["home_last"], h_name)
+        enriched["away_rolling_xg"] = compute_rolling_xg(enriched["away_last"], a_name)
+
+    if ext_l_id:
+        enriched["home_injuries"] = get_injuries(h_ext, ext_l_id)
+        enriched["away_injuries"] = get_injuries(a_ext, ext_l_id)
+        enriched["home_stats"]    = get_team_stats(h_ext, ext_l_id)
+        enriched["away_stats"]    = get_team_stats(a_ext, ext_l_id)
+        # Try football-data.org standings first (free, unlimited)
+        # Fall back to API Football only if FDOrg doesn't cover this league
+        fdorg_standings = get_standings_fdorg(our_l_id)
+        enriched["standings"] = fdorg_standings if fdorg_standings else get_standings(ext_l_id)
+        # Layer 1: squad strength — batch pre-fetched, cache hit here
+        if h_ext:
+            enriched["home_squad"] = compute_squad_strength(
+                get_squad_stats(h_ext, ext_l_id), enriched["home_injuries"])
+        if a_ext:
+            enriched["away_squad"] = compute_squad_strength(
+                get_squad_stats(a_ext, ext_l_id), enriched["away_injuries"])
+
+    enriched["has_data"] = bool(
+        enriched["h2h"] or enriched["home_last"] or enriched["home_stats"])
+except Exception as e:
+    import traceback
+    print(f"[enrich_match] {e}\n{traceback.format_exc()}")
+return enriched
+```
+
+# ═══════════════════════════════════════════════════════════════
+
+# ANALYST NARRATIVE
+
+# ═══════════════════════════════════════════════════════════════
+
+def build_analyst_narrative(enriched, h_name, a_name):
+h = h_name.split()[0]; a = a_name.split()[0]
+h_form  = enriched.get(“home_form”,[])
+a_form  = enriched.get(“away_form”,[])
+h2h     = enriched.get(“h2h_summary”)
+h_st    = enriched.get(“home_stats”)
+a_st    = enriched.get(“away_stats”)
+h_inj   = enriched.get(“home_injuries”,[])
+a_inj   = enriched.get(“away_injuries”,[])
+h_sq    = enriched.get(“home_squad”)
+a_sq    = enriched.get(“away_squad”)
+h_rxg   = enriched.get(“home_rolling_xg”)
+a_rxg   = enriched.get(“away_rolling_xg”)
+out     = {}
+
+```
+# Form
+if h_form or a_form:
+    h_pts = sum(3 if r=="W" else 1 if r=="D" else 0 for r in h_form)
+    a_pts = sum(3 if r=="W" else 1 if r=="D" else 0 for r in a_form)
+    hp = round(h_pts/max(len(h_form)*3,1)*100)
+    ap = round(a_pts/max(len(a_form)*3,1)*100)
+    hs = " ".join(h_form) or "—"; as_ = " ".join(a_form) or "—"
+    if hp > ap+20:   out["form"] = f"{h} in strong form ({hs}) · {a} struggling ({as_})"
+    elif ap > hp+20: out["form"] = f"{a} in-form ({as_}) · {h} poor run ({hs})"
+    else:            out["form"] = f"Evenly matched recent form · {h}: {hs} · {a}: {as_}"
+    if hp>=80:   out["morale"] = f"{h} full of confidence — {h_form.count('W')} wins in last {len(h_form)}"
+    elif ap>=80: out["morale"] = f"{a} on a hot streak — {a_form.count('W')} wins in last {len(a_form)}"
+    else:        out["morale"] = None
+
+# H2H
+if h2h and h2h["total"]>=3:
+    hw=h2h["home_wins"]; dr=h2h["draws"]; aw=h2h["away_wins"]; n=h2h["total"]
+    if hw/n>=0.6:   dom=f"{h} dominant in this fixture ({hw}W-{dr}D-{aw}L)"
+    elif aw/n>=0.6: dom=f"{a} historically strong here ({aw}W-{dr}D-{hw}L)"
+    elif dr/n>=0.5: dom=f"This fixture draws frequently — {dr} of {n} meetings ended level"
+    else:           dom=f"Tight H2H — {hw}W {dr}D {aw}L over {n} meetings"
+    out["h2h"] = f"{dom} · Avg {h2h['avg_goals']} goals"
+
+# Goals — rolling xG preferred over season averages
+if h_rxg and a_rxg:
+    hf=h_rxg["rolling_for"]; hag=h_rxg["rolling_against"]
+    af=a_rxg["rolling_for"]; aag=a_rxg["rolling_against"]
+    exp = round((hf+aag+af+hag)/2,1)
+    note=""
+    if h_rxg["trend"]=="RISING": note=f" · {h} scoring more in recent games"
+    elif a_rxg["trend"]=="RISING": note=f" · {a} on an attacking upswing"
+    if exp>=3.0:   out["goals"]=f"High-scoring game likely — {h} {hf:.1f}/g, {a} {af:.1f}/g (last 5){note}"
+    elif exp>=2.2: out["goals"]=f"Goals expected — {h} scores {hf:.1f}/g, {a} scores {af:.1f}/g (last 5){note}"
+    else:          out["goals"]=f"Tight match — {h} concedes {hag:.1f}/g, {a} concedes {aag:.1f}/g (last 5)"
+elif h_st and a_st:
+    hs_a=h_st.get("avg_scored",0); hc_a=h_st.get("avg_conceded",0)
+    as_a=a_st.get("avg_scored",0); ac_a=a_st.get("avg_conceded",0)
+    exp=round((hs_a+ac_a+as_a+hc_a)/2,1)
+    if exp>=3.0:   out["goals"]=f"Both sides open defensively — {h} {hs_a}/g, {a} {as_a}/g"
+    elif exp>=2.2: out["goals"]=f"Goals expected — {h} scores {hs_a}, concedes {hc_a} · {a} scores {as_a}, concedes {ac_a}"
+    else:          out["goals"]=f"Tight match likely — {h} concedes {hc_a}/g, {a} concedes {ac_a}/g"
+
+# Squad intelligence
+if h_sq and a_sq and h_sq["player_count"]>0:
+    hs=h_sq["score"]; as_s=a_sq["score"]
+    if abs(hs-as_s)>=12:
+        s=h if hs>as_s else a; ws=a if hs>as_s else h
+        out["squad"] = (f"{s} hold a clear squad quality edge "
+                       f"({max(hs,as_s):.0f}/100 vs {min(hs,as_s):.0f}/100)")
+    else:
+        out["squad"] = f"Evenly matched squads — {h} {hs:.0f}/100 vs {a} {as_s:.0f}/100"
+    if h_sq["key_missing"]>0: out["squad"]+=f" · {h} missing {h_sq['key_missing']} key player(s)"
+    if a_sq["key_missing"]>0: out["squad"]+=f" · {a} missing {a_sq['key_missing']} key player(s)"
+    if h_sq["top_players"]:
+        tp=h_sq["top_players"][0]
+        out["top_player"]=f"{h} key man: {tp['name']} ({tp['rating']:.1f} rating, {tp['goals']}G {tp['assists']}A)"
+    if a_sq["top_players"]:
+        tp=a_sq["top_players"][0]
+        out["top_player_away"]=f"{a} key man: {tp['name']} ({tp['rating']:.1f} rating, {tp['goals']}G {tp['assists']}A)"
+
+# Injuries
+miss=[]
+if h_inj: miss.append(f"{h}: {', '.join(i['name'] for i in h_inj[:2])}")
+if a_inj: miss.append(f"{a}: {', '.join(i['name'] for i in a_inj[:2])}")
+if miss: out["injuries"]=" · ".join(miss)+" sidelined"
+
+return out
+```
