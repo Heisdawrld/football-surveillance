@@ -744,6 +744,7 @@ LAYOUT = """<!DOCTYPE html>
       <a href="/" class="npill {{ 'on' if page=='home' else '' }}">Leagues</a>
       <a href="/acca" class="npill {{ 'on' if page=='acca' else '' }}">ACCA</a>
       <a href="/tracker" class="npill {{ 'on' if page=='tracker' else '' }}">Track</a>
+      <span id="quota-badge" style="font-size:.5rem;color:var(--t);padding:4px 8px;background:var(--s2);border:1px solid var(--bdr);border-radius:50px;display:none"></span>
     </div>
   </div>
 </nav>
@@ -763,6 +764,17 @@ const obs=new IntersectionObserver(entries=>{
 document.querySelectorAll('.pfill').forEach(el=>{
   el.dataset.w=parseFloat(el.style.width)||0;el.style.width='0%';obs.observe(el);
 });
+// Quota monitor — shows remaining API calls in nav
+fetch('/api/quota').then(r=>r.json()).then(d=>{
+  const b=document.getElementById('quota-badge');
+  if(b&&d.remaining!==undefined){
+    b.textContent=d.remaining+' API';
+    b.style.display='';
+    if(d.remaining<20) b.style.color='var(--r)';
+    else if(d.remaining<50) b.style.color='var(--w)';
+    else b.style.color='var(--g)';
+  }
+}).catch(()=>{});
 // Search
 const si=document.getElementById('ls');
 if(si){
@@ -1186,17 +1198,64 @@ def match_display(match_id):
             c += f'<div style="display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-top:1px solid var(--bdr)"><span style="font-weight:700;color:var(--wh);font-size:.72rem">{rk["tip"]}</span><span style="color:var(--w);font-weight:700;font-size:.72rem">{rk["prob"]}% · ~{rk["odds"]}</span></div>'
         c += '<div style="height:4px"></div></div></div>'
 
-    # ── xG ──
+    # ── xG + Squad Intel ──
+    si = res.get("squad_intel", {})
+    h_sq_score = si.get("home_score", 0)
+    a_sq_score = si.get("away_score", 0)
+    h_penalty  = si.get("home_penalty", 1.0)
+    a_penalty  = si.get("away_penalty", 1.0)
+    h_missing  = si.get("home_missing", 0)
+    a_missing  = si.get("away_missing", 0)
+    has_squad  = h_sq_score > 0 and a_sq_score > 0
+
     c += f'''<div class="g2 up d2">
       <div class="sbox"><p class="sval g">{res["xg_h"]}</p><p class="slbl">xG {h.split()[0]}</p></div>
       <div class="sbox"><p class="sval b">{res["xg_a"]}</p><p class="slbl">xG {a.split()[0]}</p></div>
     </div>'''
 
+    # Squad Strength — only shown when player data available
+    if has_squad:
+        h_sq_c = "var(--g)" if h_sq_score>=65 else "var(--w)" if h_sq_score>=45 else "var(--r)"
+        a_sq_c = "var(--g)" if a_sq_score>=65 else "var(--w)" if a_sq_score>=45 else "var(--r)"
+        h_pen_html = f'<span style="font-size:.55rem;color:var(--r)"> −{round((1-h_penalty)*100)}% xG</span>' if h_penalty < 0.95 else ""
+        a_pen_html = f'<span style="font-size:.55rem;color:var(--r)"> −{round((1-a_penalty)*100)}% xG</span>' if a_penalty < 0.95 else ""
+        h_miss_html = f'<span style="font-size:.58rem;color:var(--r)">⚠ {h_missing} key out</span>' if h_missing > 0 else ""
+        a_miss_html = f'<span style="font-size:.58rem;color:var(--r)">⚠ {a_missing} key out</span>' if a_missing > 0 else ""
+
+        # Top players from squad
+        h_top = enriched.get("home_squad", {}).get("top_players", []) if enriched.get("home_squad") else []
+        a_top = enriched.get("away_squad", {}).get("top_players", []) if enriched.get("away_squad") else []
+        h_tp  = h_top[0] if h_top else None
+        a_tp  = a_top[0] if a_top else None
+
+        c += f'''<div class="card up d2">
+          <p class="sep" style="padding-top:0;margin-top:0">⚡ Squad Intelligence</p>
+          <div class="g2" style="margin-bottom:10px">
+            <div>
+              <p style="font-size:.64rem;font-weight:700;color:var(--wh);margin-bottom:3px">{h.split()[0]}{h_pen_html}</p>
+              <div class="ptrack" style="margin-bottom:4px"><div class="pfill" style="width:{h_sq_score}%;background:{h_sq_c}"></div></div>
+              <p style="font-size:.6rem;color:{h_sq_c};font-weight:700">{h_sq_score:.0f}/100 {h_miss_html}</p>
+              {f'<p style="font-size:.6rem;color:var(--t);margin-top:3px">★ {h_tp["name"]} {h_tp["rating"]:.1f} · {h_tp["goals"]}G</p>' if h_tp else ""}
+            </div>
+            <div>
+              <p style="font-size:.64rem;font-weight:700;color:var(--wh);margin-bottom:3px;text-align:right">{a.split()[0]}{a_pen_html}</p>
+              <div class="ptrack" style="margin-bottom:4px"><div class="pfill" style="width:{a_sq_score}%;background:{a_sq_c}"></div></div>
+              <p style="font-size:.6rem;color:{a_sq_c};font-weight:700;text-align:right">{a_sq_score:.0f}/100 {a_miss_html}</p>
+              {f'<p style="font-size:.6rem;color:var(--t);margin-top:3px;text-align:right">★ {a_tp["name"]} {a_tp["rating"]:.1f} · {a_tp["goals"]}G</p>' if a_tp else ""}
+            </div>
+          </div>
+        </div>'''  
+
     # ── ANALYST VIEW ──
-    has_narr = any(narrative.get(k) for k in ["form","h2h","goals","injuries","morale"])
+    has_narr = any(narrative.get(k) for k in ["form","h2h","goals","injuries","morale","squad","top_player"])
     if has_narr:
         c += '<div class="card up d3"><p class="sep" style="padding-top:0;margin-top:0">📋 Analyst View</p>'
-        for key, label in [("form","Form"),("morale","Momentum"),("h2h","H2H Pattern"),("goals","Goal Trend"),("injuries","Absences")]:
+        for key, label in [
+            ("form","Form"),("morale","Momentum"),("h2h","H2H Pattern"),
+            ("goals","Goal Trend"),("squad","Squad Edge"),
+            ("top_player","Home Key Man"),("top_player_away","Away Key Man"),
+            ("injuries","Absences")
+        ]:
             val = narrative.get(key)
             if val:
                 c += f'<div class="analyst-item"><strong>{label} · </strong>{val}</div>'
@@ -1549,6 +1608,40 @@ def api_counts():
 def api_leagues():
     fetch_all_predictions()
     return jsonify(_LEAGUE_REGISTRY)
+
+
+# ── BATCH JOB + QUOTA MONITOR ─────────────────────────────────────────────────
+
+@app.route("/api/batch")
+def api_batch():
+    """
+    Pre-fetch squad stats for all teams playing today.
+    Call this once per day (e.g. via cron or Render scheduled job at 6am WAT).
+    Safe to call multiple times — skips teams already in 24h cache.
+    """
+    import external_data as ed
+    all_matches = fetch_all_predictions()
+    today_wat    = now_wat().date()
+    tomorrow_wat = today_wat + timedelta(days=1)
+    today_matches = [
+        m for m in all_matches
+        if parse_dt(m.get("event",{}).get("event_timestamp") or
+                    m.get("event",{}).get("event_date","")).date() in (today_wat, tomorrow_wat)
+    ]
+    result = ed.run_daily_batch(today_matches)
+    quota  = ed.get_quota_status()
+    return jsonify({
+        "status":       "ok",
+        "today_matches": len(today_matches),
+        "calls_made":   result["calls_made"],
+        "calls_skipped":result["calls_skipped"],
+        "quota":        quota,
+    })
+
+@app.route("/api/quota")
+def api_quota():
+    import external_data as ed
+    return jsonify(ed.get_quota_status())
 
 # ── UTILITIES ─────────────────────────────────────────────────────────────────
 
