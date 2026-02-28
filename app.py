@@ -1055,6 +1055,43 @@ def settle():
         return jsonify({"status":"error","error":str(e)})
 
 
+@app.route("/api/debug")
+def debug():
+    import traceback
+    out = {"status": "ok", "checks": {}}
+    # Test API-Football
+    try:
+        from datetime import datetime, timezone, timedelta
+        today = (datetime.now(timezone.utc)+timedelta(hours=1)).strftime("%Y-%m-%d")
+        raw = D._afl("/fixtures", {"date": today, "timezone": "Africa/Lagos"}, ch=0)
+        out["checks"]["api_football"] = {
+            "ok": raw is not None,
+            "count": len(raw) if raw else 0,
+            "date_tested": today,
+            "sample_league_ids": list(set(r.get("league",{}).get("id") for r in (raw or [])[:20]))[:10]
+        }
+    except Exception as e:
+        out["checks"]["api_football"] = {"ok": False, "error": str(e)}
+    # Test football-data.org
+    try:
+        fd = D._fd("/competitions/PL/matches", {"dateFrom": today, "dateTo": today}, ch=0)
+        out["checks"]["football_data"] = {"ok": fd is not None, "matches": len((fd or {}).get("matches",[]))}
+    except Exception as e:
+        out["checks"]["football_data"] = {"ok": False, "error": str(e)}
+    # Test get_fixtures_window
+    try:
+        cards = D.get_fixtures_window(3)
+        out["checks"]["fixtures_window"] = {"ok": True, "count": len(cards)}
+        if cards:
+            out["checks"]["fixtures_window"]["sample"] = [
+                {"home": c["home"], "away": c["away"], "league": c["league"], "date": c["date_label"]}
+                for c in cards[:3]
+            ]
+    except Exception as e:
+        out["checks"]["fixtures_window"] = {"ok": False, "error": str(e), "trace": traceback.format_exc()[-500:]}
+    return jsonify(out)
+
+
 @app.route("/api/morning")
 def morning():
     try:
