@@ -283,7 +283,7 @@ def _fd_fixtures_for_date(date_str):
     return result
 
 def get_fixtures_window(days=3):
-    """Fixtures for today + next N days (WAT timezone)."""
+    """Fixtures for today + next N days. Merges ALL available sources."""
     wat_now = datetime.now(timezone.utc) + timedelta(hours=WAT)
     ck = f"win_{days}_{wat_now.strftime('%Y-%m-%d')}"
     v  = _mg(ck, 0.4)
@@ -294,9 +294,120 @@ def get_fixtures_window(days=3):
         for fx in fixtures_for_date(d):
             if fx["id"] and fx["id"] not in seen:
                 seen.add(fx["id"]); all_fx.append(fx)
+    # Supplement with ESPN free API (no key, no limit, covers 30+ leagues)
+    try:
+        espn_fx = _espn_fixtures_window(days)
+        for fx in espn_fx:
+            key = f"espn_{fx['id']}"
+            if key not in seen:
+                seen.add(key); all_fx.append(fx)
+    except Exception as e:
+        print(f"[ESPN] window error: {e}")
     all_fx.sort(key=lambda f: f["kickoff"] or "")
     _ms(ck, all_fx)
     return all_fx
+
+
+ESPN_LEAGUES = {
+    # (slug, league_id_we_use, league_name, country)
+    "eng.1":    (39,  "Premier League",    "England"),
+    "esp.1":    (140, "La Liga",           "Spain"),
+    "ita.1":    (135, "Serie A",           "Italy"),
+    "ger.1":    (78,  "Bundesliga",        "Germany"),
+    "fra.1":    (61,  "Ligue 1",           "France"),
+    "uefa.champions": (2,  "Champions League", "Europe"),
+    "uefa.europa":    (3,  "Europa League",    "Europe"),
+    "uefa.europa.conf": (848, "Conference League", "Europe"),
+    "eng.2":    (40,  "Championship",      "England"),
+    "eng.3":    (41,  "League One",        "England"),
+    "ned.1":    (88,  "Eredivisie",        "Netherlands"),
+    "por.1":    (94,  "Primeira Liga",     "Portugal"),
+    "tur.1":    (203, "Super Lig",         "Turkey"),
+    "sco.1":    (179, "Scottish Prem",     "Scotland"),
+    "bel.1":    (144, "Belgian Pro League","Belgium"),
+    "gre.1":    (197, "Greek Super League","Greece"),
+    "mex.1":    (262, "Liga MX",           "Mexico"),
+    "usa.1":    (253, "MLS",               "USA"),
+    "bra.1":    (71,  "Brasileirao",       "Brazil"),
+    "arg.1":    (128, "Argentine Primera", "Argentina"),
+    "sau.1":    (307, "Saudi Pro League",  "Saudi Arabia"),
+    "jpn.1":    (98,  "J1 League",         "Japan"),
+    "den.1":    (271, "Danish Superliga",  "Denmark"),
+    "swe.1":    (113, "Allsvenskan",       "Sweden"),
+    "nor.1":    (103, "Eliteserien",       "Norway"),
+    "aut.1":    (218, "Austrian Bundesliga","Austria"),
+    "pol.1":    (106, "Ekstraklasa",       "Poland"),
+    "rom.1":    (207, "Romanian Liga 1",   "Romania"),
+    "cze.1":    (283, "Czech Liga",        "Czech Republic"),
+    "egy.1":    (233, "Egyptian Premier",  "Egypt"),
+    "rsa.1":    (323, "South African PSL", "South Africa"),
+}
+
+def _espn_fixtures_window(days=3):
+    """ESPN public API — free, no key, covers 30+ leagues."""
+    wat_now = datetime.now(timezone.utc) + timedelta(hours=WAT)
+    result = []; seen = set()
+    for slug, (lg_id, lg_name, country) in ESPN_LEAGUES.items():
+        for i in range(days):
+            d = (wat_now + timedelta(days=i)).strftime("%Y%m%d")
+            ck = f"espn_{slug}_{d}"
+            cached = _mg(ck, 1)
+            if cached is not None:
+                for fx in cached:
+                    k = f"espn_{fx['id']}"
+                    if k not in seen: seen.add(k); result.append(fx)
+                continue
+            try:
+                url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard"
+                r = requests.get(url, params={"dates": d}, timeout=10)
+                if r.status_code != 200: continue
+                data = r.json()
+                day_fx = []
+                for ev in data.get("events", []):
+                    comp = ev.get("competitions", [{}])[0]
+                    competitors = comp.get("competitors", [])
+                    if len(competitors) < 2: continue
+                    home = next((c for c in competitors if c.get("homeAway")=="home"), competitors[0])
+                    away = next((c for c in competitors if c.get("homeAway")=="away"), competitors[1])
+                    status = comp.get("status", {})
+                    ss = status.get("type", {}).get("shortDetail", "NS")
+                    state = status.get("type", {}).get("state", "pre")
+                    live = state == "in"
+                    ft   = state == "post"
+                    h_sc = int(home.get("score", 0)) if (live or ft) else None
+                    a_sc = int(away.get("score", 0)) if (live or ft) else None
+                    ko = comp.get("date", ev.get("date",""))
+                    kod = _dt(ko)
+                    tod = (datetime.now(timezone.utc)+timedelta(hours=WAT)).date()
+                    tmr = tod + timedelta(days=1)
+                    if kod.date()==tod:  dl="TODAY"
+                    elif kod.date()==tmr: dl="TOMORROW"
+                    else: dl=kod.strftime("%a %d %b").lstrip("0").upper()
+                    fid = f"{lg_id}_{ev.get('id','')}"
+                    fx = {
+                        "id": fid,
+                        "home_id": home.get("team",{}).get("id"),
+                        "home":    home.get("team",{}).get("displayName","Home"),
+                        "away_id": away.get("team",{}).get("id"),
+                        "away":    away.get("team",{}).get("displayName","Away"),
+                        "league_id": lg_id, "league": lg_name, "country": country,
+                        "season":  _current_season(),
+                        "kickoff": ko, "date_label": dl,
+                        "state":   ss if live else ("FT" if ft else "NS"),
+                        "is_live": live, "is_ft": ft, "is_ns": not live and not ft,
+                        "score_h": h_sc, "score_a": a_sc,
+                        "venue": "", "referee": None, "_raw": ev,
+                    }
+                    day_fx.append(fx)
+                    k = f"espn_{fid}"
+                    if k not in seen: seen.add(k); result.append(fx)
+                _ms(ck, day_fx)
+            except Exception as e:
+                print(f"[ESPN] {slug} {d}: {e}")
+    print(f"[ESPN] fetched {len(result)} fixtures")
+    return result
+
+
 
 def get_live_fixtures():
     raw = _afl("/fixtures", {"live":"all"}, ch=0.08) or []
