@@ -213,13 +213,12 @@ def get_live_standings(league_id):
 # ─────────────────────────────────────────────────────────────
 
 def get_predictions(fixture_id):
-    return _get(f"/predictions/probabilities",
-                {"filter[fixture_id]": fixture_id},
+    # Sportmonks v3: use fixture-specific endpoint
+    return _get(f"/predictions/probabilities/fixtures/{fixture_id}",
                 cache_hours=6)
 
 def get_value_bets(fixture_id):
-    return _get(f"/predictions/value-bets",
-                {"filter[fixture_id]": fixture_id},
+    return _get(f"/predictions/value-bets/fixtures/{fixture_id}",
                 cache_hours=6)
 
 def parse_predictions(raw):
@@ -247,9 +246,8 @@ def parse_predictions(raw):
 # ─────────────────────────────────────────────────────────────
 
 def get_odds(fixture_id):
-    return _get(f"/odds/pre-match",
-                {"filter[fixture_id]": fixture_id,
-                 "include": "bookmaker;market",
+    return _get(f"/odds/pre-match/fixtures/{fixture_id}",
+                {"include": "bookmaker;market",
                  "per_page": 100},
                 cache_hours=3) or []
 
