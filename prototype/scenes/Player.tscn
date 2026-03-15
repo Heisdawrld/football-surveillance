@@ -1,4 +1,4 @@
-[gd_scene load_steps=5 format=3 uid="uid://dyt6kgv4hb6tx"]
+[gd_scene load_steps=14 format=3 uid="uid://dyt6kgv4hb6tx"]
 
 [ext_resource type="Script" path="res://scripts/player.gd" id="1"]
 
@@ -6,20 +6,89 @@
 radius = 0.45
 height = 1.1
 
-[sub_resource type="CapsuleMesh" id="2"]
-radius = 0.45
-mid_height = 1.1
+[sub_resource type="StandardMaterial3D" id="2"]
+albedo_color = Color(0.82, 0.09, 0.11, 1)
+roughness = 0.32
+
+[sub_resource type="StandardMaterial3D" id="3"]
+albedo_color = Color(0.9, 0.72, 0.12, 1)
+emission_enabled = true
+emission = Color(0.4, 0.28, 0.05, 1)
+emission_energy_multiplier = 0.35
+roughness = 0.2
+
+[sub_resource type="CapsuleMesh" id="4"]
+radius = 0.42
+mid_height = 0.72
+
+[sub_resource type="SphereMesh" id="5"]
+radius = 0.32
+height = 0.64
+
+[sub_resource type="BoxMesh" id="6"]
+size = Vector3(0.16, 0.72, 0.16)
+
+[sub_resource type="BoxMesh" id="7"]
+size = Vector3(0.6, 0.1, 0.64)
+
+[sub_resource type="BoxMesh" id="8"]
+size = Vector3(0.45, 0.14, 0.3)
+
+[sub_resource type="BoxMesh" id="9"]
+size = Vector3(0.7, 0.15, 3.2)
+
+[sub_resource type="StandardMaterial3D" id="10"]
+transparency = 1
+albedo_color = Color(1, 0.32, 0.16, 0.38)
+emission_enabled = true
+emission = Color(1, 0.52, 0.2, 1)
+emission_energy_multiplier = 1.35
+shading_mode = 0
 
 [node name="Player" type="CharacterBody3D"]
 script = ExtResource("1")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="."]
 shape = SubResource("1")
-position = Vector3(0, 1, 0)
+position = Vector3(0, 1.02, 0)
 
-[node name="BodyMesh" type="MeshInstance3D" parent="."]
-mesh = SubResource("2")
-position = Vector3(0, 1, 0)
+[node name="VisualRoot" type="Node3D" parent="."]
+
+[node name="SuitBody" type="MeshInstance3D" parent="VisualRoot"]
+mesh = SubResource("4")
+material_override = SubResource("2")
+position = Vector3(0, 1.05, 0)
+
+[node name="Head" type="MeshInstance3D" parent="VisualRoot"]
+mesh = SubResource("5")
+material_override = SubResource("2")
+position = Vector3(0, 1.95, 0)
+
+[node name="LeftLegAccent" type="MeshInstance3D" parent="VisualRoot"]
+mesh = SubResource("6")
+material_override = SubResource("3")
+position = Vector3(-0.14, 0.47, 0)
+
+[node name="RightLegAccent" type="MeshInstance3D" parent="VisualRoot"]
+mesh = SubResource("6")
+material_override = SubResource("3")
+position = Vector3(0.14, 0.47, 0)
+
+[node name="ChestAccent" type="MeshInstance3D" parent="VisualRoot"]
+mesh = SubResource("7")
+material_override = SubResource("3")
+position = Vector3(0, 1.35, -0.03)
+
+[node name="VisorAccent" type="MeshInstance3D" parent="VisualRoot"]
+mesh = SubResource("8")
+material_override = SubResource("3")
+position = Vector3(0, 1.93, -0.2)
+
+[node name="SpeedTrail" type="MeshInstance3D" parent="VisualRoot"]
+visible = false
+mesh = SubResource("9")
+material_override = SubResource("10")
+position = Vector3(0, 1.0, 1.7)
 
 [node name="Camera3D" type="Camera3D" parent="."]
 current = true
